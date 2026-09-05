@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.egg-info/
+*.session
+*.part
+*.play
+playo.egg-info/
