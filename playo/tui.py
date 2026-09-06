@@ -669,6 +669,7 @@ class LiveView:
         # still downloading/streaming; lyrics must be ready when audio starts
         if app.current:
             app._load_lyrics_async()
+            app._load_album_async()
 
     # ---------- render ----------
     def _render(self):
@@ -970,8 +971,12 @@ class LiveView:
             qpos = app.index + 1 if app.index is not None else 0
         label = "queue" if app.shuffle else "track"
         q = f"{DIM}[{label} {qpos}/{len(app.tracks)}]{RST}"
+        album = getattr(app, "lrc_album", None)
+        album_bit = (f"  {GREEN}· Album: {album}{RST}" if album
+                     and album.lower() not in tr.title.lower()
+                     else "")
         line = f" {ACCENT}{status}{RST} {BOLD}{tr.title}{RST} " \
-               f"{DIM}— {tr.artist or '?'}{RST} {q}"
+               f"{DIM}— {tr.artist or '?'}{RST}{album_bit} {q}"
         out.append(fit(line, w))
         pos = app.player.position_ms() / 1000
         pb = progress_bar(pos, tr.duration, max(10, min(30, w - 40)))

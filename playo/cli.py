@@ -9,7 +9,7 @@ import time
 
 from colorama import just_fix_windows_console
 
-from . import config as cfgmod, lyrics as lyrics_mod, telegram_sync
+from . import config as cfgmod, lyrics as lyrics_mod, metadata as metadata_mod, telegram_sync
 from .library import scan, Track
 from .player import Player
 
@@ -85,6 +85,9 @@ class PlayoApp:
         self.lrc_plain = None
         self.lrc_synced = False
         self.lrc_key = None        # (title, artist) whose lyrics are loaded
+        self.lrc_album = None      # album name for the now-playing bar
+        self._album_key = None     # (title, artist) whose album is loaded
+        self._album_fails = {}     # lookup back-off: key -> retry-after
         self.player = Player(volume=self.cfg.get("volume", 80) / 100.0)
         self.player.on_end = self._auto_next
         self._sync_lock = threading.Lock()
@@ -604,6 +607,8 @@ class PlayoApp:
     # ---------- lyrics ----------
     def _reset_lyrics(self):
         self.lrc = self.lrc_plain = self.lrc_key = None
+        self.lrc_album = None
+        self._album_key = None
         self._lyrics_fetching = None
         self._lyrics_gen = getattr(self, "_lyrics_gen", 0) + 1
 
@@ -648,6 +653,37 @@ class PlayoApp:
             self.lrc_synced = synced
             self.lrc_key = key
             self._lyrics_fetching = None
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_album_async(self):
+        """Fetch the real album name (iTunes → Deezer) in the background.
+
+        Independent of lyrics — the album shows even when LRCLIB has
+        nothing for this track. A failed lookup backs off for 10 min."""
+        tr = self.current
+        if not tr:
+            return
+        key = (tr.title, tr.artist)
+        if self._album_key == key:
+            return
+        now = time.time()
+        if now < self._album_fails.get(key, 0):
+            return
+        gen = getattr(self, "_lyrics_gen", 0)
+
+        def worker():
+            try:
+                album = metadata_mod.fetch_album(
+                    tr.artist, tr.title, tr.duration)
+            except Exception:
+                album = None
+            if getattr(self, "_lyrics_gen", 0) != gen:
+                return          # another track started meanwhile
+            self._album_key = key
+            self.lrc_album = album
+            if album is None:
+                self._album_fails[key] = time.time() + 600
 
         threading.Thread(target=worker, daemon=True).start()
 
