@@ -95,7 +95,7 @@ class LiveView:
         self.searching = False        # ON only after Tab; OFF = player keys
         self.sel = 0                  # selection within hits
         self.show_lyrics = True
-        self.overlay = None           # None | "settings" | "help"
+        self.overlay = None           # None | "settings"
         self._last_vol = 60
         self.hits = list(range(len(app.tracks)))
 
@@ -104,8 +104,8 @@ class LiveView:
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):
             ch2 = msvcrt.getwch()
-            # full F-key map: F6=sort, F5/F7..F12 were falling through to
-            # "?" (= help) before — sort key looked dead
+            # full F-key map: F6=sort, F5/F7..F12 used to fall through —
+            # sort key looked dead
             return {"H": "up", "P": "down", "K": "left", "M": "right",
                     "G": "home", "O": "end", "I": "pgup", "Q": "pgdn",
                     "S": "del", "R": "ins", ";": "f1", "<": "f2", "=": "f3",
@@ -417,10 +417,6 @@ class LiveView:
         if self.overlay == "settings":
             self._handle_settings(key)
             return
-        if self.overlay == "help":
-            if key in ("esc", "?", "h"):
-                self.overlay = None
-            return
 
         app = self.app
         K = app.keys()
@@ -465,8 +461,6 @@ class LiveView:
                 self._set_filter("")       # clear filter, cursor stays put
             else:
                 raise KeyboardInterrupt
-        elif key == K["help"]:
-            self.overlay = "help"
         elif key in ("o", "f3") or key == K["settings"]:
             self._overlay_sel = self.sel     # library selection to restore
             self.overlay = "settings"
@@ -750,7 +744,7 @@ class LiveView:
             L.append(fit(f"    {DIM}+−|↑↓{RST} vol  {DIM}{K['mute']}{RST} mute"
                          f"  {DIM}F3{RST} settings  {DIM}{K['shuffle']}{RST}"
                          f" shuffle  {DIM}z{RST} shuf-play  {DIM}{K['sort']}{RST}"
-                         f" sort  {DIM}F4{RST} lyrics  {DIM}?{RST} keys"
+                         f" sort  {DIM}F4{RST} lyrics"
                          f"  {DIM}Esc²{RST} quit", w))
         if self.flt and not self.searching:
             # filter stays applied after search closes — make that obvious
@@ -955,8 +949,8 @@ class LiveView:
         out = []
         if not tr:
             total = len(app.tracks)
-            msg = (f"{DIM}Tab search · Enter play · Space pause ·"
-                   f" ? help{RST}" if total else
+            msg = (f"{DIM}Tab search · Enter play · Space pause{RST}" if total
+                   else
                    f"{DIM}catalog empty — new channel posts appear here live{RST}")
             out.append(fit(f" {status} {msg}", w))
             dl = sum(1 for t in app.tracks if t.downloaded)
@@ -1036,18 +1030,7 @@ class LiveView:
         — bottom bar stays visible). Box borders always full-width aligned."""
         w = cols - 1
         body_rows = len(L)
-        if self.overlay == "help":
-            lines = [
-                f"{BOLD}SHORTCUTS{RST}",
-                f" {DIM}search{RST}  Tab=arm search · type=filters ·"
-                f" ↑↓/PgUp/PgDn=browse · Enter=play · Esc=clear filter",
-                f" {DIM}playback{RST} Space=play/pause · ←/→=seek (mode from"
-                f" settings) · +/− or ↑↓=volume · Del=mute",
-                f" {DIM}tracks{RST}   n=next · p=prev · z=shuffle play",
-                f" {DIM}modes{RST}   s=shuffle · y=sort · v=lyrics ·"
-                f" r=rescan · F3=settings · Esc²=quit",
-            ]
-        else:
+        if self.overlay == "settings":
             lines = [f"{BOLD}SETTINGS{RST}  {DIM}(↑↓ select · ←/→ adjust ·"
                      f" Enter toggle · Esc close){RST}"]
             if getattr(self, "_edit_mode", False):

@@ -95,7 +95,6 @@ and then opens the dashboard.
 | `v` / `F4` | show / hide lyrics |
 | `r` / `F8` | rescan the download folder |
 | `F3` | settings (volume, sort, seek mode, channel, sync now, …) |
-| `?` | shortcut cheat-sheet |
 | `Esc` `Esc` | quit |
 
 ## Settings overlay (`F3`)

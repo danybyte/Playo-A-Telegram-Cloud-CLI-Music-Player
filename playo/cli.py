@@ -169,7 +169,7 @@ class PlayoApp:
     SORTS = ("title", "artist", "duration", "recent")
 
     DEFAULT_KEYS = {
-        "search": "tab", "settings": "f3", "help": "?",
+        "search": "tab", "settings": "f3",
         "next": "n", "prev": "p", "shuffle": "s",
         "sort": "y", "lyrics": "v", "mute": "m",
     }
@@ -949,7 +949,7 @@ class PlayoApp:
         if cmd in ("exit", "quit"):
             self.player.close()
             return False
-        elif cmd in ("help", "?"):
+        elif cmd == "help":
             print(HELP)
         elif cmd == "setup":
             self.cmd_setup()
