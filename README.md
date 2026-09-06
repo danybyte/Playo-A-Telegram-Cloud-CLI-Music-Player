@@ -117,7 +117,7 @@ Highlights:
 | `~/.playo/config.json` | settings |
 | `~/.playo/catalog.json` | channel index (msg id ↔ title/artist/size) |
 | `~/.playo/error.log` | error log |
-| download folder (default `E:\Music`) | the actual audio files |
+| download folder (default `C:\Users\<username>\Music`) | the actual audio files |
 
 ## How it works
 

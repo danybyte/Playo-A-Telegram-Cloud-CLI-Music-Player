@@ -11,7 +11,7 @@ DEFAULTS = {
     "bot_token": "",
     "user_session": False,       # True = login with a personal account (no bot)
     "channel": "",               # @username or numeric id like -1001234...
-    "download_dir": "E:\\Music",
+    "download_dir": os.path.join(os.path.expanduser("~"), "Music"),
     "last_msg_id": 0,            # for incremental sync
     "auto_sync": True,           # background sync at startup (every 30s)
     "sort": "title",             # library sort: title | artist | duration | recent
