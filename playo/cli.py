@@ -939,22 +939,6 @@ class PlayoApp:
         self._lyrics_fetching = None
         self._lyric_candidates = None
 
-    def clear_lyrics(self, tracks):
-        """Delete saved lyrics for the given tracks. The playing track
-        drops its loaded lyric and refetches (picker reopens in pick
-        mode); the rest refetch on their next play."""
-        cur = self.current
-        cur_p = os.path.normcase(cur.path) if cur else None
-        n = 0
-        for t in tracks:
-            if lyrics_mod.clear_cache(t.artist, t.title):
-                n += 1
-            if getattr(self, "_lyrics_fails", None):
-                self._lyrics_fails.pop((t.title, t.artist), None)
-            if cur_p and os.path.normcase(t.path) == cur_p:
-                self._reset_lyrics()
-        return n
-
     def _load_album_async(self):
         """Fetch the real album name (iTunes → Deezer) in the background.
 

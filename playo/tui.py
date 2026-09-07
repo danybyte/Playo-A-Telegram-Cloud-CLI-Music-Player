@@ -96,7 +96,6 @@ class LiveView:
         self.sel = 0                  # selection within hits
         self.show_lyrics = True
         self.overlay = None           # None | "settings" | "picker"
-        self.pick = None              # None | set(track idx) — lyric reset
         self._last_vol = 60
         self.hits = list(range(len(app.tracks)))
 
@@ -401,42 +400,6 @@ class LiveView:
                 self._edit = str(app.cfg.get(name, ""))
                 self._edit_mode = True
 
-    # ---------- multi-select lyric reset ----------
-    # '+' marks songs, Enter resets their lyrics. Selection persists
-    # across search/filter changes, Esc clears it.
-    def _pick_toggle(self):
-        if self.pick is None:
-            self.pick = set()
-        if not self.hits:
-            return
-        i = self.hits[self.sel]
-        if i in self.pick:
-            self.pick.discard(i)
-            self._note(f"deselected — {len(self.pick)} marked"
-                       if self.pick else "selection cleared")
-        else:
-            self.pick.add(i)
-            self._note(f"marked — {len(self.pick)} selected"
-                       f"  (Enter = reset their lyrics)")
-
-    def _pick_reset(self):
-        app = self.app
-        idxs = sorted(self.pick or set())
-        tracks = [app.tracks[i] for i in idxs if i < len(app.tracks)]
-        n = app.clear_lyrics(tracks)
-        self.pick = None
-        self._note(f"lyrics reset for {n}/{len(tracks)} songs"
-                   f" — will refetch on next play")
-
-    def _pick_maybe_clear(self):
-        """Drop selection entries that no longer exist (rescan/resort)."""
-        if self.pick:
-            self.pick = {i for i in self.pick if i < len(self.app.tracks)}
-
-    def _pick_count(self):
-        self._pick_maybe_clear()
-        return len(self.pick or ())
-
     # ---------- manual full sync (settings) ----------
     def _sync_now(self):
         """Re-index the ENTIRE channel in the background (no downloads).
@@ -529,10 +492,7 @@ class LiveView:
             self._search_touch()
             self._note("search ON — type to filter · 2s idle = off")
         elif key == "esc":
-            if self.pick:
-                self.pick = None
-                self._note("selection cleared")
-            elif self.flt:
+            if self.flt:
                 self._set_filter("")       # clear filter, cursor stays put
             else:
                 raise KeyboardInterrupt
@@ -540,7 +500,7 @@ class LiveView:
             self._overlay_sel = self.sel     # library selection to restore
             self.overlay = "settings"
             self.sel = 0
-        elif key == "=":
+        elif key in ("+", "="):
             app.set_volume(int(app.player.volume * 100) + 5)
         elif key == "-":
             app.set_volume(int(app.player.volume * 100) - 5)
@@ -550,8 +510,6 @@ class LiveView:
             self._toggle_shuffle()
         elif key in ("y", "f6") or (K["sort"] and key == K["sort"]):
             self._note(f"sorted by {app.cycle_sort()}")
-        elif key == "+":
-            self._pick_toggle()
         elif key in ("v", "f4") or (K["lyrics"] and key == K["lyrics"]):
             self._toggle_lyrics()
         elif key in ("n", ">") or (K["next"] and key == K["next"]):
@@ -573,9 +531,7 @@ class LiveView:
             self.hits = self._hits()
             self._note("library rescanned")
         elif key in ("\r", "\n"):
-            if self.pick:
-                self._pick_reset()
-            elif self.hits:
+            if self.hits:
                 self._play(self.hits[self.sel])
         elif key == " ":
             if app.player.state == "playing":
@@ -869,8 +825,7 @@ class LiveView:
                          f"{DIM}Space{RST} play/pause  {DIM}Enter{RST} play sel"
                          f"  {DIM}{K['next']}{RST} next  {DIM}{K['prev']}{RST}"
                          f" prev  {DIM}←→{RST} seek", w))
-            L.append(fit(f"    {DIM}=−|↑↓{RST} vol  {DIM}+{RST} mark  "
-                         f"{DIM}{K['mute']}{RST} mute"
+            L.append(fit(f"    {DIM}+−|↑↓{RST} vol  {DIM}{K['mute']}{RST} mute"
                          f"  {DIM}F3{RST} settings  {DIM}{K['shuffle']}{RST}"
                          f" shuffle  {DIM}z{RST} shuf-play  {DIM}{K['sort']}{RST}"
                          f" sort  {DIM}F4{RST} lyrics"
@@ -922,10 +877,6 @@ class LiveView:
         hdr = f"LIBRARY  {len(self.hits)}/{len(app.tracks)}  ·  sort: {sort}"
         if app.shuffle:
             hdr += f"  ·  {GREEN}SHUFFLE{RST}"
-        n = self._pick_count()
-        if n:
-            hdr += (f"  ·  {GREEN}{n} MARKED{RST} {DIM}(Enter reset lyrics"
-                    f" · Esc cancel){RST}")
         vol = int(app.player.volume * 100)
         if vol == 0:
             hdr += f"  ·  {YELLOW}MUTED{RST}"
@@ -968,8 +919,6 @@ class LiveView:
                 else:
                     tag = f"{DIM}· {RST}"
                 sel_o = f"{ACCENT}{BOLD}>{RST}" if pos == self.sel else " "
-                if self.pick and i in self.pick:
-                    tag = f"{GREEN}+ {RST}"
                 playing = (i == app.index and app.player.state == "playing")
                 out.append(self._row(f"{sel_o}{tag}", f"{i + 1:>4}", t.title,
                                      t.artist, fmt(t.duration), w, playing))
