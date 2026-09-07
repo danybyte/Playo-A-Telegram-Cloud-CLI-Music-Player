@@ -16,6 +16,7 @@ DEFAULTS = {
     "auto_sync": True,           # background sync at startup (every 30s)
     "sort": "title",             # library sort: title | artist | duration | recent
     "seek_back": "seconds",      # ← key: "seconds" (±5s) or "lyric" (prev line)
+    "lyrics_pick": False,        # ON = pick from the first 5 lyric results
     "volume": 80,
 }
 

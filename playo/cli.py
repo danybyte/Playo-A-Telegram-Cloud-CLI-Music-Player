@@ -86,11 +86,13 @@ class PlayoApp:
         self.lrc_synced = False
         self.lrc_key = None        # (title, artist) whose lyrics are loaded
         self.lrc_album = None      # album name for the now-playing bar
+        self._lyric_candidates = None   # pick mode: first N source results
         self._album_key = None     # (title, artist) whose album is loaded
         self._album_fails = {}     # lookup back-off: key -> retry-after
         self.player = Player(volume=self.cfg.get("volume", 80) / 100.0)
         self.player.on_end = self._auto_next
         self.player.on_stall = self._stream_stall
+        self.player.on_release = self._on_mixer_release   # .play cleanup hook
         self._stream_ctx = None       # (gen, state, part) of the live stream
         self._auto_advance = False    # True while the queue picks the track
         self._auto_fails = 0          # consecutive failed auto-advances
@@ -102,6 +104,7 @@ class PlayoApp:
         self._dl_error = None
         self._dl_progress = None               # (cur_bytes, total_bytes)
         self._stream_dest = None
+        self._retired_playfiles = []      # .play copies awaiting deletion
         self._notes = []                       # thread-safe UI notifications
         self._tui_note = None
         self.rescan()
@@ -339,6 +342,14 @@ class PlayoApp:
                 self.play_index(j)
                 return
 
+    def load(self, path):
+        """Mixer entry: load a file, then drop stale .play leftovers.
+
+        The released file of a FINISHED stream is deleted here — the
+        mixer held it while playing, so removal had to wait until now."""
+        self.player.load(path)
+        self._purge_retired()
+
     def play_index(self, i, auto=False):
         auto_pending = auto or getattr(self, "_auto_advance", False)
         self._auto_advance = False
@@ -383,7 +394,7 @@ class PlayoApp:
                 self._stream_fail_retry(self._stream_gen)
             return
         try:
-            self.player.load(tr.path)
+            self.load(tr.path)
         except Exception as e:
             if not getattr(self, "_tui", False):
                 print(f"Error playing {tr.title}: {e}")
@@ -398,6 +409,22 @@ class PlayoApp:
         self._dl_error = None
         if not getattr(self, "_tui", False):
             print(f"{CYAN}▶ {tr.title}  —  {tr.artist or 'unknown'}{RST}")
+
+    def _purge_retired(self):
+        """Delete .play copies the mixer has already released."""
+        while self._retired_playfiles:
+            f = self._retired_playfiles.pop(0)
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except OSError:
+                pass
+
+    def _on_mixer_release(self):
+        """Player hook: the mixer just stopped/unloaded — a retired .play
+        copy is no longer held, delete it now."""
+        self._cleanup_playfiles()
+        self._purge_retired()
 
     def play_async(self, i):
         """TUI: download in a background thread, then play.
@@ -474,8 +501,11 @@ class PlayoApp:
                     app._stream_ctx = None     # cancelled
                     return
                 if state["started"]:
-                    # seamless finish: release the mixer (frees .play),
-                    # promote the .part, reload the final file in place
+                    # finish the .play copy FIRST (while nothing else has
+                    # moved the mixer): complete copy = untouched mixer =
+                    # no click at 100%. The full copy plays to the true
+                    # end; on_stall advances the queue.
+                    ok = app._finish_playfile(part, state)
                     if path.endswith(".part"):
                         # the mixer holds .play, not .part — the rename is
                         # safe while playing; retry: AV/indexer handles can
@@ -489,27 +519,40 @@ class PlayoApp:
                                 time.sleep(0.4)
                     if app._stream_gen != gen:
                         return        # ended / re-picked during the waits
-                    # capture AFTER the retries — the song kept playing
-                    # while they ran, so an earlier stamp would rewind it
-                    pos_ms = app.player.position_ms()
-                    app.player.stop()
                     app.rescan()
                     for j, t in enumerate(app.tracks):
                         if os.path.normcase(t.path) == os.path.normcase(dest):
                             app.index = j
                             break
+                    app._stream_ctx = None
+                    now = app.player.state
+                    if now == "stopped":
+                        # the user stopped while this was downloading —
+                        # land the file, stay stopped (never auto-play)
+                        app._delete_playfile_now()
+                        app.notify(f"download finished — {tr.title} (stopped)")
+                        return
+                    if ok and now in ("playing", "paused"):
+                        app._retire_playfile()   # delete once released
+                        return
+                    if ok and now == "buffering":
+                        # was stalled waiting for data — the tail is here
+                        app.player.resume_buffering()
+                        app._retire_playfile()
+                        return
+                    # fallback (odd state / incomplete copy): reload in place
+                    # capture AFTER the retries — the song kept playing
+                    # while they ran, so an earlier stamp would rewind it
+                    pos_ms = app.player.position_ms()
+                    app.player.stop()
                     # if the promotion failed, play the complete .part —
                     # going silent here killed the queue in the past
                     src = dest if os.path.exists(dest) else path
                     app.player.load_at(src, pos_ms / 1000)
                     app.player.suppress_end = False
-                    app._stream_ctx = None
-                    try:
-                        pf = getattr(app, "_stream_playfile", None)
-                        if pf and os.path.exists(pf):
-                            os.remove(pf)
-                    except OSError:
-                        pass
+                    app._delete_playfile_now()
+                    app._cleanup_playfiles()
+                    app._purge_retired()
                 else:
                     if path.endswith(".part"):
                         try:
@@ -517,6 +560,13 @@ class PlayoApp:
                         except OSError as e:
                             app._dl_error = f"promote: {e}"
                     app.rescan()
+                    if app.player.state == "stopped":
+                        # user stopped while buffering — land the file,
+                        # never auto-play
+                        app._stream_ctx = None
+                        app._delete_playfile_now()
+                        app.notify(f"download finished — {tr.title} (stopped)")
+                        return
                     app.play_path(dest)
                     if app.player.state != "playing" and auto:
                         # play_path silently bailed after an auto-advance —
@@ -587,6 +637,7 @@ class PlayoApp:
             state["copied"] = os.path.getsize(self._stream_playfile)
             self.player.load_at(self._stream_playfile, pos_ms / 1000)
             self.player.suppress_end = True
+            self._cleanup_playfiles()
         except Exception as e:
             import traceback
             self._dl_error = f"hop: {e}"
@@ -600,12 +651,91 @@ class PlayoApp:
         finally:
             state["hopping"] = False
 
+    # ---------- stream .play file helpers ----------
+    def _cleanup_playfiles(self):
+        """Delete stale .play leftovers (old hops), keep the live one."""
+        live = getattr(self, "_stream_playfile", None)
+        dd = self.cfg["download_dir"]
+        try:
+            for name in os.listdir(dd):
+                if name.endswith(".play") and \
+                        os.path.join(dd, name) != live:
+                    try:
+                        os.remove(os.path.join(dd, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def _finish_playfile(self, part, state):
+        """Make the .play copy the COMPLETE song (the final hop).
+
+        Returns True when the copy already holds the whole track — then
+        the mixer is left UNTOUCHED (no stop/reload = no click at 100%)
+        and plays to the true end. Only an incomplete copy triggers one
+        seamless hop."""
+        pf = getattr(self, "_stream_playfile", None)
+        if not pf or not os.path.exists(pf) or not os.path.exists(part):
+            return False
+        try:
+            complete = os.path.getsize(pf) >= os.path.getsize(part)
+        except OSError:
+            return False
+        if complete or self.player.state in ("paused", "stopped"):
+            # complete → nothing to do; paused → never yank the user
+            # back into playback; stopped → never auto-start one
+            # (caller reloads in place if incomplete)
+            return complete
+        if state.get("hopping"):
+            return False                    # a hop is already mid-flight
+        state["hopping"] = True
+        try:
+            pos_ms = self.player.position_ms()
+            self.player.freeze()            # releases the old handle
+            shutil.copyfile(part, pf)       # full bytes — the tail included
+            state["copied"] = os.path.getsize(pf)
+            self.player.load_at(pf, pos_ms / 1000)
+            self.player.suppress_end = True
+            return True
+        except Exception as e:
+            try:
+                from . import config as _c
+                with open(os.path.join(_c.CONFIG_DIR, "error.log"), "a",
+                          encoding="utf-8") as f:
+                    f.write(f"[finish_playfile] {e!r}\n")
+            except Exception:
+                pass
+            return False
+        finally:
+            state["hopping"] = False
+
+    def _retire_playfile(self):
+        """Keep the .play copy but remember to delete it after the mixer
+        releases it (on the next load/stop — see _cleanup_playfiles)."""
+        pf = getattr(self, "_stream_playfile", None)
+        if pf:
+            self._retired_playfiles.append(pf)
+            self._stream_playfile = None
+
+    def _delete_playfile_now(self):
+        pf = getattr(self, "_stream_playfile", None)
+        self._stream_playfile = None
+        if not pf:
+            return
+        try:
+            os.remove(pf)
+        except OSError:
+            # still held — delete on the next mixer release instead
+            self._retired_playfiles.append(pf)
+
     def _maybe_start_stream(self, part, dest, i, state):
         """Start playback once the .part file holds enough audio.
 
         pygame rejects a partially-written MP3 while its header/tags are
-        incomplete, so we retry as the file grows until it parses."""
-        if state["started"] or self.player.state in ("playing", "paused"):
+        incomplete, so we retry as the file grows until it parses.
+        ONLY from 'buffering' — a user stop must never auto-start the
+        mixer halfway through a download."""
+        if state["started"] or self.player.state != "buffering":
             return
         size = 0
         try:
@@ -620,6 +750,8 @@ class PlayoApp:
             self.player.load(playfile)
             self.player.suppress_end = True
             self._auto_fails = 0
+            self._cleanup_playfiles()
+            self._purge_retired()
             # index was already set at pick time; keep it pointed at the
             # streaming track (a rescan in between could have moved it)
             for j, t in enumerate(self.tracks):
@@ -724,13 +856,16 @@ class PlayoApp:
         self.lrc_album = None
         self._album_key = None
         self._lyrics_fetching = None
+        self._lyric_candidates = None
         self._lyrics_gen = getattr(self, "_lyrics_gen", 0) + 1
 
     def _load_lyrics_async(self):
         """Fetch lyrics in a background thread — never blocks the UI loop.
 
         A failed lookup is remembered for 60 s so the UI doesn't hammer
-        LRCLIB every frame (which made 'searching…' flash forever)."""
+        LRCLIB every frame (which made 'searching…' flash forever).
+        Pick mode (lyrics_pick): candidates land in _lyric_candidates and
+        the TUI opens the picker overlay instead of showing text."""
         tr = self.current
         if not tr:
             return
@@ -739,6 +874,17 @@ class PlayoApp:
         if self.lrc_key == key or \
                 getattr(self, "_lyrics_fetching", None) == key:
             return
+        if getattr(self, "_lyric_candidates", None):
+            return        # picker is showing the list — wait for the pick
+        # cached lyrics are final — no picker for a known track
+        if self.cfg.get("lyrics_pick"):
+            try:
+                text, synced = lyrics_mod.load_cache(tr.artist, tr.title)
+            except Exception:
+                text = None
+            if text:
+                self._apply_lyric_text(key, text, synced)
+                return
         fails = getattr(self, "_lyrics_fails", None)
         if fails is None:
             fails = self._lyrics_fails = {}
@@ -746,10 +892,16 @@ class PlayoApp:
             return
         self._lyrics_fetching = key
         gen = getattr(self, "_lyrics_gen", 0)
+        pick_mode = bool(self.cfg.get("lyrics_pick"))
 
         def worker():
             try:
-                text, synced = lyrics_mod.fetch(tr.artist, tr.title, tr.duration)
+                if pick_mode:
+                    cands = lyrics_mod.search_all(tr.artist, tr.title,
+                                                  tr.duration, limit=5)
+                else:
+                    text, synced = lyrics_mod.fetch(tr.artist, tr.title,
+                                                    tr.duration)
             except Exception:
                 fails[key] = now + 60          # back off before retrying
                 self._lyrics_fetching = None
@@ -757,6 +909,14 @@ class PlayoApp:
             # a newer track may have started while we were fetching
             if getattr(self, "_lyrics_gen", 0) != gen:
                 self._lyrics_fetching = None
+                return
+            if pick_mode:
+                self._lyric_candidates = cands
+                self._lyrics_fetching = None
+                if not cands:
+                    fails[key] = now + 60
+                    self.lrc_key = key    # UI: "(no lyrics found)"
+                # the TUI notices _lyric_candidates and opens the picker
                 return
             if synced:
                 self.lrc = lyrics_mod.parse_lrc(text) or None
@@ -769,6 +929,31 @@ class PlayoApp:
             self._lyrics_fetching = None
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_lyric_text(self, key, text, synced):
+        """Install a (possibly user-picked) lyric for the current track."""
+        self.lrc = lyrics_mod.parse_lrc(text) if synced else None
+        self.lrc_plain = None if synced else text
+        self.lrc_synced = synced
+        self.lrc_key = key
+        self._lyrics_fetching = None
+        self._lyric_candidates = None
+
+    def clear_lyrics(self, tracks):
+        """Delete saved lyrics for the given tracks. The playing track
+        drops its loaded lyric and refetches (picker reopens in pick
+        mode); the rest refetch on their next play."""
+        cur = self.current
+        cur_p = os.path.normcase(cur.path) if cur else None
+        n = 0
+        for t in tracks:
+            if lyrics_mod.clear_cache(t.artist, t.title):
+                n += 1
+            if getattr(self, "_lyrics_fails", None):
+                self._lyrics_fails.pop((t.title, t.artist), None)
+            if cur_p and os.path.normcase(t.path) == cur_p:
+                self._reset_lyrics()
+        return n
 
     def _load_album_async(self):
         """Fetch the real album name (iTunes → Deezer) in the background.
@@ -1011,10 +1196,10 @@ class PlayoApp:
     def cmd_set(self, key, *value):
         val = " ".join(value)
         if key not in ("channel", "download_dir", "bot_token", "api_hash",
-                       "api_id", "user_session", "auto_sync"):
-            print("Valid keys: channel | download_dir | bot_token | api_hash | api_id | user_session | auto_sync")
+                       "api_id", "user_session", "auto_sync", "lyrics_pick"):
+            print("Valid keys: channel | download_dir | bot_token | api_hash | api_id | user_session | auto_sync | lyrics_pick")
             return
-        if key in ("user_session", "auto_sync"):
+        if key in ("user_session", "auto_sync", "lyrics_pick"):
             val = val.lower() in ("1", "true", "yes", "on")
         if key == "api_id":
             val = int(val)

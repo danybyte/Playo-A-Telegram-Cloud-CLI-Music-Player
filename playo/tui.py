@@ -95,7 +95,8 @@ class LiveView:
         self.searching = False        # ON only after Tab; OFF = player keys
         self.sel = 0                  # selection within hits
         self.show_lyrics = True
-        self.overlay = None           # None | "settings"
+        self.overlay = None           # None | "settings" | "picker"
+        self.pick = None              # None | set(track idx) — lyric reset
         self._last_vol = 60
         self.hits = list(range(len(app.tracks)))
 
@@ -233,6 +234,11 @@ class LiveView:
                        "indexes ALL history (854 songs need this)",
         "user_session": "ON = personal account (full history) · "
                         "OFF = bot only (new posts only)",
+        "lyrics_pick": "ON = before showing lyrics, list the first 5 source "
+                       "results — ↑↓ + Enter picks, lyrics are saved",
+        "lyrics_reset": "deletes every lyric file in ~/.playo/lyrics — "
+                        "next plays refetch from the source. To reset only "
+                        "some songs: + on them, then Enter",
         "sync_now":   "full re-index — fills gaps the incremental "
                       "auto-sync missed",
     }
@@ -243,14 +249,19 @@ class LiveView:
         K = app.keys()
         keys_cfg = app.cfg.get("keys") or {}
         rows = [
+            ("_sec", "PLAYBACK", ""),
             ("volume",     f"[{volume_bar(vol)}] {vol:3d}%", "←/→"),
             ("shuffle",    "ON " if app.shuffle else "OFF",
                            f"enter · key: {K['shuffle'] or '—'}"),
             ("sort",       app.cfg.get("sort", "title"), "enter cycles"),
             ("seek_back",  app.cfg.get("seek_back", "seconds"),
                            "←/→ · seconds | lyric"),
-            ("auto_sync",  ("ON " if app.cfg.get("auto_sync", True) else "OFF"),
-                           "enter"),
+            ("_sec", "LYRICS", ""),
+            ("lyrics_pick", ("ON " if app.cfg.get("lyrics_pick") else "OFF"),
+                       "enter · pick from 5 lyric results"),
+            ("lyrics_reset", "reset all",
+                       "enter · deletes ALL saved lyrics"),
+            ("_sec", "KEYS", ""),
         ]
         # rebindable keys (letters are reserved for search — use F-keys/symbols)
         for action in ("next", "prev", "shuffle", "sort", "lyrics", "mute"):
@@ -259,6 +270,9 @@ class LiveView:
             rows.append((f"key:{action}", shown,
                          "Enter, then press an F-key"))
         rows += [
+            ("_sec", "TELEGRAM / LIBRARY", ""),
+            ("auto_sync",  ("ON " if app.cfg.get("auto_sync", True) else "OFF"),
+                           "enter"),
             ("sync_now",   ("syncing…" if getattr(self, "_sync_busy", False)
                             else "run now"),
                            "enter — re-index the whole channel"),
@@ -290,6 +304,9 @@ class LiveView:
         app = self.app
         rows = self._settings_rows()
         self.sel = min(self.sel, len(rows) - 1)
+        # section headers are labels, not rows — never rest on one
+        while self.sel < len(rows) - 1 and rows[self.sel][0] == "_sec":
+            self.sel += 1
         name = rows[self.sel][0]
 
         def save():
@@ -300,8 +317,12 @@ class LiveView:
             self._close_overlay()
         elif key == "up":
             self.sel = max(0, self.sel - 1)
+            while self.sel > 0 and rows[self.sel][0] == "_sec":
+                self.sel -= 1
         elif key == "down":
             self.sel = min(len(rows) - 1, self.sel + 1)
+            while self.sel < len(rows) - 1 and rows[self.sel][0] == "_sec":
+                self.sel += 1
         elif key == "f2" or (key == "left" and name == "sort"):
             if name == "sort":
                 keys = list(app.SORTS)
@@ -347,6 +368,18 @@ class LiveView:
             elif name == "auto_sync":
                 app.cfg["auto_sync"] = not app.cfg.get("auto_sync", True)
                 save()
+            elif name == "lyrics_pick":
+                app.cfg["lyrics_pick"] = not app.cfg.get("lyrics_pick", False)
+                save()
+                app._reset_lyrics()       # re-fetch with the new mode
+                self._note("lyric picker "
+                           + ("ON — pick from the first 5 results"
+                              if app.cfg["lyrics_pick"] else "OFF"))
+            elif name == "lyrics_reset":
+                from . import lyrics as lyrics_mod
+                n = lyrics_mod.clear_all_cache()
+                app._reset_lyrics()       # current track refetches
+                self._note(f"ALL saved lyrics wiped ({n} files)")
             elif name == "user_session":
                 app.cfg["user_session"] = not app.cfg.get("user_session")
                 save()
@@ -367,6 +400,42 @@ class LiveView:
                 self._edit_key = name
                 self._edit = str(app.cfg.get(name, ""))
                 self._edit_mode = True
+
+    # ---------- multi-select lyric reset ----------
+    # '+' marks songs, Enter resets their lyrics. Selection persists
+    # across search/filter changes, Esc clears it.
+    def _pick_toggle(self):
+        if self.pick is None:
+            self.pick = set()
+        if not self.hits:
+            return
+        i = self.hits[self.sel]
+        if i in self.pick:
+            self.pick.discard(i)
+            self._note(f"deselected — {len(self.pick)} marked"
+                       if self.pick else "selection cleared")
+        else:
+            self.pick.add(i)
+            self._note(f"marked — {len(self.pick)} selected"
+                       f"  (Enter = reset their lyrics)")
+
+    def _pick_reset(self):
+        app = self.app
+        idxs = sorted(self.pick or set())
+        tracks = [app.tracks[i] for i in idxs if i < len(app.tracks)]
+        n = app.clear_lyrics(tracks)
+        self.pick = None
+        self._note(f"lyrics reset for {n}/{len(tracks)} songs"
+                   f" — will refetch on next play")
+
+    def _pick_maybe_clear(self):
+        """Drop selection entries that no longer exist (rescan/resort)."""
+        if self.pick:
+            self.pick = {i for i in self.pick if i < len(self.app.tracks)}
+
+    def _pick_count(self):
+        self._pick_maybe_clear()
+        return len(self.pick or ())
 
     # ---------- manual full sync (settings) ----------
     def _sync_now(self):
@@ -414,6 +483,9 @@ class LiveView:
         if getattr(self, "_bind_mode", False):
             self._handle_bind(key)
             return
+        if self.overlay == "picker":
+            self._handle_picker(key)
+            return
         if self.overlay == "settings":
             self._handle_settings(key)
             return
@@ -457,7 +529,10 @@ class LiveView:
             self._search_touch()
             self._note("search ON — type to filter · 2s idle = off")
         elif key == "esc":
-            if self.flt:
+            if self.pick:
+                self.pick = None
+                self._note("selection cleared")
+            elif self.flt:
                 self._set_filter("")       # clear filter, cursor stays put
             else:
                 raise KeyboardInterrupt
@@ -465,7 +540,7 @@ class LiveView:
             self._overlay_sel = self.sel     # library selection to restore
             self.overlay = "settings"
             self.sel = 0
-        elif key in ("+", "="):
+        elif key == "=":
             app.set_volume(int(app.player.volume * 100) + 5)
         elif key == "-":
             app.set_volume(int(app.player.volume * 100) - 5)
@@ -475,6 +550,8 @@ class LiveView:
             self._toggle_shuffle()
         elif key in ("y", "f6") or (K["sort"] and key == K["sort"]):
             self._note(f"sorted by {app.cycle_sort()}")
+        elif key == "+":
+            self._pick_toggle()
         elif key in ("v", "f4") or (K["lyrics"] and key == K["lyrics"]):
             self._toggle_lyrics()
         elif key in ("n", ">") or (K["next"] and key == K["next"]):
@@ -496,7 +573,9 @@ class LiveView:
             self.hits = self._hits()
             self._note("library rescanned")
         elif key in ("\r", "\n"):
-            if self.hits:
+            if self.pick:
+                self._pick_reset()
+            elif self.hits:
                 self._play(self.hits[self.sel])
         elif key == " ":
             if app.player.state == "playing":
@@ -664,6 +743,55 @@ class LiveView:
         if app.current:
             app._load_lyrics_async()
             app._load_album_async()
+        self._check_picker()
+
+    def _check_picker(self):
+        """Pick mode: when the candidate list lands, open the picker
+        overlay (unless settings is open — it opens right after)."""
+        app = self.app
+        cands = getattr(app, "_lyric_candidates", None)
+        if self.overlay == "picker":
+            if not cands:
+                self._close_overlay()     # track changed / cleared
+            return
+        if cands and self.overlay is None:
+            self._overlay_sel = self.sel  # library selection to restore
+            self.overlay = "picker"
+            self.sel = 0
+
+    def _picker_apply(self, idx):
+        app = self.app
+        cands = getattr(app, "_lyric_candidates", None) or []
+        if not (0 <= idx < len(cands)):
+            return
+        from . import lyrics as lyrics_mod
+        artist, track, album, dur, text, synced = cands[idx]
+        tr = app.current
+        if tr:
+            lyrics_mod.save_cache(tr.artist, tr.title, text, synced)
+            app._apply_lyric_text((tr.title, tr.artist), text, synced)
+        self._close_overlay()
+        self._note(f"lyrics: {clip(artist, 24)} — {clip(track, 30)}"
+                   f"{'  (saved)' if tr else ''}")
+
+    def _handle_picker(self, key):
+        app = self.app
+        cands = getattr(app, "_lyric_candidates", None) or []
+        if key == "esc":
+            # auto-apply the best match (synced first) — old behavior
+            best = next((i for i, c in enumerate(cands) if c[5]), 0)
+            if cands:
+                self._picker_apply(best)
+            else:
+                self._close_overlay()
+        elif key == "up":
+            self.sel = max(0, self.sel - 1)
+        elif key == "down":
+            self.sel = min(max(0, len(cands) - 1), self.sel + 1)
+        elif key in ("\r", "\n"):
+            self._picker_apply(self.sel)
+        elif isinstance(key, str) and len(key) == 1 and key in "12345":
+            self._picker_apply(int(key) - 1)
 
     # ---------- render ----------
     def _render(self):
@@ -741,7 +869,8 @@ class LiveView:
                          f"{DIM}Space{RST} play/pause  {DIM}Enter{RST} play sel"
                          f"  {DIM}{K['next']}{RST} next  {DIM}{K['prev']}{RST}"
                          f" prev  {DIM}←→{RST} seek", w))
-            L.append(fit(f"    {DIM}+−|↑↓{RST} vol  {DIM}{K['mute']}{RST} mute"
+            L.append(fit(f"    {DIM}=−|↑↓{RST} vol  {DIM}+{RST} mark  "
+                         f"{DIM}{K['mute']}{RST} mute"
                          f"  {DIM}F3{RST} settings  {DIM}{K['shuffle']}{RST}"
                          f" shuffle  {DIM}z{RST} shuf-play  {DIM}{K['sort']}{RST}"
                          f" sort  {DIM}F4{RST} lyrics"
@@ -793,6 +922,10 @@ class LiveView:
         hdr = f"LIBRARY  {len(self.hits)}/{len(app.tracks)}  ·  sort: {sort}"
         if app.shuffle:
             hdr += f"  ·  {GREEN}SHUFFLE{RST}"
+        n = self._pick_count()
+        if n:
+            hdr += (f"  ·  {GREEN}{n} MARKED{RST} {DIM}(Enter reset lyrics"
+                    f" · Esc cancel){RST}")
         vol = int(app.player.volume * 100)
         if vol == 0:
             hdr += f"  ·  {YELLOW}MUTED{RST}"
@@ -835,6 +968,8 @@ class LiveView:
                 else:
                     tag = f"{DIM}· {RST}"
                 sel_o = f"{ACCENT}{BOLD}>{RST}" if pos == self.sel else " "
+                if self.pick and i in self.pick:
+                    tag = f"{GREEN}+ {RST}"
                 playing = (i == app.index and app.player.state == "playing")
                 out.append(self._row(f"{sel_o}{tag}", f"{i + 1:>4}", t.title,
                                      t.artist, fmt(t.duration), w, playing))
@@ -1030,7 +1165,25 @@ class LiveView:
         — bottom bar stays visible). Box borders always full-width aligned."""
         w = cols - 1
         body_rows = len(L)
-        if self.overlay == "settings":
+        if self.overlay == "picker":
+            lines = [f"{GREEN}{BOLD}PICK LYRICS{RST}  "
+                     f"{DIM}(↑↓ · 1-5 · Enter apply · Esc = best match){RST}"]
+            cands = getattr(self.app, "_lyric_candidates", None) or []
+            for k, (artist, track, album, dur, text, synced) in enumerate(cands):
+                cur = k == self.sel
+                o = f"{ACCENT}{BOLD}>{RST}" if cur else f"{DIM}{k + 1}{RST}"
+                style = BOLD if cur else ""
+                n_lines = len(text.splitlines())
+                label = (f"{artist} — {track}"
+                         + (f"  [{album}]" if album else "")
+                         + f"  {fmt(dur) if dur else ''}"
+                         + (f"  {GREEN}synced{RST}" if synced
+                            else f"  {DIM}plain{RST}"))
+                lines.append(f" {o} {style}{clip(label, w - 12)}{RST}"
+                             f"  {DIM}· {n_lines} lines{RST}")
+            if not cands:
+                lines.append(f" {DIM}no results{RST}")
+        elif self.overlay == "settings":
             lines = [f"{BOLD}SETTINGS{RST}  {DIM}(↑↓ select · ←/→ adjust ·"
                      f" Enter toggle · Esc close){RST}"]
             if getattr(self, "_edit_mode", False):
@@ -1041,6 +1194,10 @@ class LiveView:
             else:
                 rows = self._settings_rows()
                 for k, (name, val, hint) in enumerate(rows):
+                    if name == "_sec":
+                        lines.append(f" {DIM}── {BOLD}{val}{RST}{DIM} "
+                                     f"{'─' * max(2, 30 - len(val))}{RST}")
+                        continue
                     cur = k == self.sel
                     o = f"{ACCENT}{BOLD}>{RST}" if cur else " "
                     style = BOLD if cur else ""

@@ -13,6 +13,7 @@ class Player:
         self.state = "stopped"        # stopped | playing | paused | buffering
         self.on_end = None
         self.on_stall = None          # mixer ran dry mid-stream (suppress_end)
+        self.on_release = None        # mixer stopped/unloaded a file
         self.suppress_end = False     # True while streaming a growing file
         self._base_ms = 0
         self._tick = 0.0
@@ -49,6 +50,13 @@ class Player:
     def toggle(self):
         self.pause() if self.state == "playing" else self.play()
 
+    def _release(self):
+        if self.on_release:
+            try:
+                self.on_release()
+            except Exception:
+                pass
+
     def stop(self):
         if pygame.mixer.get_init():
             pygame.mixer.music.stop()
@@ -58,9 +66,12 @@ class Player:
                 pygame.mixer.music.unload()
             except Exception:
                 pass
+        was_playing = self.state != "stopped"
         self.state = "stopped"
         self._base_ms = 0
         self.suppress_end = False
+        if was_playing:
+            self._release()
 
     def freeze(self):
         """Release the mixer's file handle while keeping the displayed
@@ -73,6 +84,7 @@ class Player:
                 pass
         self.state = "buffering"
         self.suppress_end = True
+        self._release()
 
     def load_at(self, path, sec):
         """Load and start from `sec` seconds in one go (seamless swaps)."""
