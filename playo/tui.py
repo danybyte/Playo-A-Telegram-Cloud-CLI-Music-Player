@@ -130,11 +130,14 @@ class LiveView:
         """Change the filter, but keep the cursor on the SAME track.
 
         So after searching, picking a song and clearing the search (Esc),
-        the selection stays on that song inside the full list."""
+        the selection stays on that song inside the full list. The active
+        filter also becomes the playback context: next/prev/auto-advance
+        walk the results on screen until the filter is closed."""
         prev = self.hits[self.sel] \
             if self.hits and self.sel < len(self.hits) else None
         self.flt = text
         self.hits = self._hits()
+        self.app.set_context(self.hits if self.flt else None)
         if prev is not None and prev in self.hits:
             self.sel = self.hits.index(prev)
         else:
@@ -479,9 +482,8 @@ class LiveView:
                     self.sel = max(0, self.sel - 10)
                 else:
                     self.sel = min(max(0, len(self.hits) - 1), self.sel + 10)
-            elif isinstance(key, str) and len(key) == 1 and key.isprintable() \
-                    and key != " ":
-                self._set_filter(self.flt + key)
+            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                self._set_filter(self.flt + key)   # space types a space
                 self._search_touch()
             return
 
@@ -754,6 +756,9 @@ class LiveView:
         app = self.app
         cols, rows = shutil.get_terminal_size((100, 30))
         self.hits = self._hits()
+        # an open filter IS the playback context — next/prev/auto-advance
+        # follow the on-screen results until the filter is closed
+        app.set_context(self.hits if self.flt else None)
         # sel means SETTINGS-ROW index while an overlay is open — clamping
         # it against the track count pinned the cursor at 'seek_back'
         # (row 3) whenever the library had ≤ len(settings rows) hits

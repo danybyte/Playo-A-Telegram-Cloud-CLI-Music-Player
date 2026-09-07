@@ -100,6 +100,7 @@ class PlayoApp:
         self._auto_stop = threading.Event()
         self._auto_thread = None
         self.catalog = cfgmod.load_catalog()   # songs seen in the channel (no files)
+        self.ctx_queue = None                  # search-results queue (TUI filter)
         self._dl_status = None                 # title while a TUI download runs
         self._dl_error = None
         self._dl_progress = None               # (cur_bytes, total_bytes)
@@ -151,6 +152,7 @@ class PlayoApp:
                                 msg_id=e["msg_id"], downloaded=False))
         self.tracks = tracks
         self.apply_sort()
+        self.ctx_queue = None   # track indices shifted — the TUI re-sets it
         self.index = None
         if cur:
             c = os.path.normcase(cur)
@@ -220,6 +222,8 @@ class PlayoApp:
         self.rebuild_order()
         # tell the view where the playing track landed (selection anchor)
         self._sort_stamp = getattr(self, "_sort_stamp", 0) + 1
+        # indices shifted — the TUI re-sets the context next frame
+        self.ctx_queue = None
 
     def cycle_sort(self):
         i = self.SORTS.index(self.cfg.get("sort", "title"))
@@ -274,17 +278,37 @@ class PlayoApp:
                 self.order.insert(0, self.index)
 
     def _find(self, q):
-        """Space-insensitive search: 'song4' matches 'Song 4'.
+        """Space-insensitive search: 'song4' matches 'Song 4', and the
+        ARTIST name matches too — every word of the query must appear in
+        the title, the artist, or the filename (all spaces squeezed).
 
         Typing has no space key (Space = play/pause), so the query is
-        matched with spaces squeezed out on both sides."""
+        matched with spaces squeezed out on both sides. A query like
+        'artisttitle' (no separator) also matches 'Artist - Title' via
+        the joined field."""
+        words = [w for w in q.lower().split() if w]
         q = q.lower().replace(" ", "")
         if not q:
             return list(range(len(self.tracks)))
-        return [i for i, t in enumerate(self.tracks)
-                if q in t.title.lower().replace(" ", "")
-                or q in t.artist.lower().replace(" ", "")
-                or q in os.path.basename(t.path).lower().replace(" ", "")]
+
+        def hit(t):
+            title = t.title.lower().replace(" ", "")
+            artist = t.artist.lower().replace(" ", "")
+            fname = os.path.basename(t.path).lower().replace(" ", "")
+            joined = artist + title
+            # every typed word must land somewhere (artist OR title)
+            if words and all(
+                    w.replace(" ", "") in title
+                    or w.replace(" ", "") in artist
+                    or w.replace(" ", "") in fname
+                    or w.replace(" ", "") in joined
+                    for w in words):
+                return True
+            # plain substring across the squeezed fields, so a query
+            # spanning 'end of title + start of artist' hits too
+            return q in title or q in artist or q in fname or q in joined
+
+        return [i for i, t in enumerate(self.tracks) if hit(t)]
 
     @property
     def current(self):
@@ -293,6 +317,12 @@ class PlayoApp:
         return self.tracks[self.index]
 
     # ---------- playback ----------
+    def set_context(self, idxs):
+        """Search-results queue: while set, next/prev/auto-advance walk
+        THIS list (the TUI sets it from the active filter and clears it
+        when the filter is closed)."""
+        self.ctx_queue = list(idxs) if idxs else None
+
     def toggle_shuffle(self):
         self.shuffle = not self.shuffle
         self.cfg["shuffle"] = self.shuffle
@@ -301,9 +331,19 @@ class PlayoApp:
         return self.shuffle
 
     def _step(self, direction=1):
-        """Next/prev respecting shuffle order; returns track index or None."""
+        """Next/prev. Inside a search-results context (ctx_queue set by
+        the TUI while a filter is open) the walk follows THAT list — so
+        the next song is the next result on screen. Without a context the
+        old system applies: shuffle → random order, else sorted order."""
         if not self.tracks:
             return None
+        ctx = [i for i in (getattr(self, "ctx_queue", None) or [])
+               if isinstance(i, int) and 0 <= i < len(self.tracks)]
+        if ctx:
+            if self.index is not None and self.index in ctx:
+                pos = ctx.index(self.index)
+                return ctx[(pos + direction) % len(ctx)]
+            return ctx[0] if direction > 0 else ctx[-1]
         if self.index is None or self.index not in self.order:
             return self.order[0]
         pos = self.order.index(self.index)
@@ -520,10 +560,14 @@ class PlayoApp:
                     if app._stream_gen != gen:
                         return        # ended / re-picked during the waits
                     app.rescan()
+                    if app._stream_gen != gen:
+                        return        # a newer pick landed during the rescan
                     for j, t in enumerate(app.tracks):
                         if os.path.normcase(t.path) == os.path.normcase(dest):
                             app.index = j
                             break
+                    if app._stream_gen != gen:
+                        return     # never clobber a NEWER stream's state
                     app._stream_ctx = None
                     now = app.player.state
                     if now == "stopped":
@@ -550,6 +594,8 @@ class PlayoApp:
                     src = dest if os.path.exists(dest) else path
                     app.player.load_at(src, pos_ms / 1000)
                     app.player.suppress_end = False
+                    if now == "paused":
+                        app.player.pause()     # was paused — stay paused
                     app._delete_playfile_now()
                     app._cleanup_playfiles()
                     app._purge_retired()
@@ -623,9 +669,9 @@ class PlayoApp:
         else:
             need = (part_size - state["copied"]) < 512 * 1024
         if need or (tot > 0 and part_size >= tot):
-            self._stream_hop(part, state)
+            self._stream_hop(part, dest, i, state)
 
-    def _stream_hop(self, part, state):
+    def _stream_hop(self, part, dest, i, state):
         """Swap to a fresh copy of the grown download, resume seamlessly."""
         if state.get("hopping") or not getattr(self, "_stream_playfile", None):
             return
@@ -637,6 +683,13 @@ class PlayoApp:
             state["copied"] = os.path.getsize(self._stream_playfile)
             self.player.load_at(self._stream_playfile, pos_ms / 1000)
             self.player.suppress_end = True
+            # keep NOW PLAYING glued to the streaming track
+            for j, t in enumerate(self.tracks):
+                if os.path.normcase(t.path) == os.path.normcase(dest):
+                    self.index = j
+                    break
+            else:
+                self.index = i
             self._cleanup_playfiles()
         except Exception as e:
             import traceback
@@ -758,6 +811,8 @@ class PlayoApp:
                 if os.path.normcase(t.path) == os.path.normcase(dest):
                     self.index = j
                     break
+            else:
+                self.index = i     # locate failed — NEVER fall back to old
             # lyrics were already fetched while buffering — do NOT reset them
             state["started"] = True
             state["copied"] = os.path.getsize(playfile)
@@ -932,6 +987,9 @@ class PlayoApp:
 
     def _apply_lyric_text(self, key, text, synced):
         """Install a (possibly user-picked) lyric for the current track."""
+        tr = self.current
+        if tr and (tr.title, tr.artist) != key:
+            return        # stale — another track is playing now, drop it
         self.lrc = lyrics_mod.parse_lrc(text) if synced else None
         self.lrc_plain = None if synced else text
         self.lrc_synced = synced
