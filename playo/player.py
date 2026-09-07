@@ -12,6 +12,7 @@ class Player:
         self.volume = volume
         self.state = "stopped"        # stopped | playing | paused | buffering
         self.on_end = None
+        self.on_stall = None          # mixer ran dry mid-stream (suppress_end)
         self.suppress_end = False     # True while streaming a growing file
         self._base_ms = 0
         self._tick = 0.0
@@ -136,12 +137,24 @@ class Player:
     def _monitor(self):
         while not self._stop_evt.wait(0.4):
             if self.state == "playing" and not self.busy:
-                self.state = "stopped"
-                if self.on_end and not self.suppress_end:
+                if self.suppress_end and self.on_stall:
+                    # mid-stream the mixer ran dry: the buffered audio caught
+                    # up with the download, or the song is over. Freeze the
+                    # clock and let the app decide — going to 'stopped' here
+                    # used to kill the stream AND the auto-advance silently
+                    self._base_ms = self.position_ms()
+                    self.state = "buffering"
                     try:
-                        self.on_end()
+                        self.on_stall()
                     except Exception:
                         pass
+                else:
+                    self.state = "stopped"
+                    if self.on_end:
+                        try:
+                            self.on_end()
+                        except Exception:
+                            pass
 
     def close(self):
         self._stop_evt.set()

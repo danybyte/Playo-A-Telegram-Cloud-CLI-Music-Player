@@ -90,6 +90,10 @@ class PlayoApp:
         self._album_fails = {}     # lookup back-off: key -> retry-after
         self.player = Player(volume=self.cfg.get("volume", 80) / 100.0)
         self.player.on_end = self._auto_next
+        self.player.on_stall = self._stream_stall
+        self._stream_ctx = None       # (gen, state, part) of the live stream
+        self._auto_advance = False    # True while the queue picks the track
+        self._auto_fails = 0          # consecutive failed auto-advances
         self._sync_lock = threading.Lock()
         self._auto_stop = threading.Event()
         self._auto_thread = None
@@ -335,11 +339,14 @@ class PlayoApp:
                 self.play_index(j)
                 return
 
-    def play_index(self, i):
+    def play_index(self, i, auto=False):
+        auto_pending = auto or getattr(self, "_auto_advance", False)
+        self._auto_advance = False
         self._stream_gen = getattr(self, "_stream_gen", 0) + 1
         prev = getattr(self, "_stream_cancel", None)
         if prev:
             prev.set()                             # cancel any in-flight stream
+        self._stream_ctx = None
         self._dl_status = None
         self._dl_progress = None
         if not self.tracks:
@@ -351,6 +358,8 @@ class PlayoApp:
         if not tr.downloaded and tr.msg_id:
             entry = self._catalog_by_msg(tr.msg_id)
             if not entry:
+                if auto_pending:
+                    self._stream_fail_retry(self._stream_gen)
                 return
             if not getattr(self, "_tui", False):
                 print(f"{DIM}↓ {tr.title} — downloading...{RST}")
@@ -365,9 +374,13 @@ class PlayoApp:
             except Exception as e:
                 if not getattr(self, "_tui", False):
                     print(f"Download failed: {e}")
+                if auto_pending:
+                    self._stream_fail_retry(self._stream_gen)
                 return
             self.rescan()
             self.play_path(tr.path)          # re-locate and play the file on disk
+            if self.player.state != "playing" and auto_pending:
+                self._stream_fail_retry(self._stream_gen)
             return
         try:
             self.player.load(tr.path)
@@ -376,8 +389,11 @@ class PlayoApp:
                 print(f"Error playing {tr.title}: {e}")
             else:
                 self._dl_error = f"load: {e}"
+            if auto_pending:
+                self._stream_fail_retry(self._stream_gen)
             return
         self.index = i
+        self._auto_fails = 0
         self._reset_lyrics()
         self._dl_error = None
         if not getattr(self, "_tui", False):
@@ -388,18 +404,22 @@ class PlayoApp:
 
         Interrupts any in-flight stream/download — the user's pick always
         wins, so next/prev/Enter always respond instantly."""
+        auto = getattr(self, "_auto_advance", False)
+        self._auto_advance = False
         if i is None or not self.tracks or i >= len(self.tracks):
             return
         tr = self.tracks[i]
         if tr.downloaded or not tr.msg_id:
-            self.play_index(i)
+            self.play_index(i, auto=auto)
             return
         entry = self._catalog_by_msg(tr.msg_id)
         if not entry:
+            if auto:
+                self._stream_fail_retry(self._stream_gen)
             return
-        self.play_streaming(i, entry)
+        self.play_streaming(i, entry, auto=auto)
 
-    def play_streaming(self, i, entry):
+    def play_streaming(self, i, entry, auto=False):
         """Play the song while it downloads, Windows-safe.
 
         The downloader appends to <file>.part (lock-free); the mixer plays a
@@ -429,6 +449,7 @@ class PlayoApp:
         part = dest + ".part"
         app = self
         state = {"started": False, "copied": 0, "hopping": False}
+        self._stream_ctx = (gen, state, part)
 
         def on_progress(cur, tot):
             if app._stream_gen != gen:
@@ -450,25 +471,39 @@ class PlayoApp:
                 if app._stream_gen != gen:
                     return                     # user picked another song
                 if path is None:
-                    return                     # cancelled
+                    app._stream_ctx = None     # cancelled
+                    return
                 if state["started"]:
                     # seamless finish: release the mixer (frees .play),
                     # promote the .part, reload the final file in place
+                    if path.endswith(".part"):
+                        # the mixer holds .play, not .part — the rename is
+                        # safe while playing; retry: AV/indexer handles can
+                        # hold the fresh file briefly on Windows
+                        for _ in range(6):
+                            try:
+                                os.replace(path, dest)
+                                break
+                            except OSError as e:
+                                app._dl_error = f"promote: {e}"
+                                time.sleep(0.4)
+                    if app._stream_gen != gen:
+                        return        # ended / re-picked during the waits
+                    # capture AFTER the retries — the song kept playing
+                    # while they ran, so an earlier stamp would rewind it
                     pos_ms = app.player.position_ms()
                     app.player.stop()
-                    if path.endswith(".part"):
-                        try:
-                            os.replace(path, dest)
-                        except OSError as e:
-                            app._dl_error = f"promote: {e}"
                     app.rescan()
                     for j, t in enumerate(app.tracks):
                         if os.path.normcase(t.path) == os.path.normcase(dest):
                             app.index = j
                             break
-                    if os.path.exists(dest):
-                        app.player.load_at(dest, pos_ms / 1000)
+                    # if the promotion failed, play the complete .part —
+                    # going silent here killed the queue in the past
+                    src = dest if os.path.exists(dest) else path
+                    app.player.load_at(src, pos_ms / 1000)
                     app.player.suppress_end = False
+                    app._stream_ctx = None
                     try:
                         pf = getattr(app, "_stream_playfile", None)
                         if pf and os.path.exists(pf):
@@ -483,6 +518,12 @@ class PlayoApp:
                             app._dl_error = f"promote: {e}"
                     app.rescan()
                     app.play_path(dest)
+                    if app.player.state != "playing" and auto:
+                        # play_path silently bailed after an auto-advance —
+                        # keep the queue moving (play_path bumped the gen,
+                        # so pass the CURRENT one or the timer bails)
+                        app._stream_fail_retry(app._stream_gen)
+                    app._stream_ctx = None
             except Exception as e:
                 if app._stream_gen != gen:
                     return
@@ -491,6 +532,7 @@ class PlayoApp:
                 # never started, so show a plain stopped state
                 if not state["started"]:
                     app.player.state = "stopped"
+                app._stream_ctx = None
                 import traceback
                 from . import config as _c
                 try:
@@ -500,6 +542,9 @@ class PlayoApp:
                                 f" stream: {e!r}\n{traceback.format_exc()}\n")
                 except Exception:
                     pass
+                # auto-advance picked this track and the stream died —
+                # keep the queue moving instead of going silent
+                app._stream_fail_retry(gen, auto)
             finally:
                 if app._stream_gen == gen:
                     app._dl_status = None
@@ -574,6 +619,7 @@ class PlayoApp:
             self._stream_playfile = playfile
             self.player.load(playfile)
             self.player.suppress_end = True
+            self._auto_fails = 0
             # index was already set at pick time; keep it pointed at the
             # streaming track (a rescan in between could have moved it)
             for j, t in enumerate(self.tracks):
@@ -598,11 +644,79 @@ class PlayoApp:
             return
         tr = self.tracks[i]
         if getattr(self, "_tui", False):
+            self._auto_advance = True
             self.play_async(i)
             return
         if not tr.downloaded and tr.msg_id:
             print(f"{DIM}[auto] ↓ next: {tr.title} — downloading...{RST}")
+        self._auto_advance = True
         self.play_index(i)
+
+    def _stream_fail_retry(self, gen, auto):
+        """Auto-advance hit a dead track (download failure, corrupt file).
+
+        Move to the NEXT track after a short pause — bounded, so a broken
+        catalog can't spin the whole queue in a loop. Manual picks never
+        come here."""
+        if not auto:
+            return
+        app = self
+
+        def retry():
+            if app._stream_gen != gen:
+                return
+            app._auto_fails += 1
+            if app._auto_fails > 5:
+                app.notify("auto-advance: too many failures in a row — stopped")
+                app._auto_fails = 0
+                return
+            app._auto_next()
+
+        t = threading.Timer(2.0, retry)
+        t.daemon = True
+        t.start()
+
+    def _stall_giveup(self, gen):
+        """The stream never produced more audio after a stall — end the
+        track like a normal finish so the queue keeps moving."""
+        if gen != self._stream_gen or self.player.state != "buffering":
+            return                     # resumed or the user picked something
+        self._stream_ctx = None
+        self._auto_next()
+
+    def _stream_stall(self):
+        """Mixer ran dry mid-stream (suppressed end): the buffer caught up
+        with the download — resume when more audio lands — or the song is
+        really over — advance to the next track. on_end never fires while
+        suppress_end is set, so this is the only way the queue moves on."""
+        ctx = getattr(self, "_stream_ctx", None)
+        if ctx is None or ctx[0] != self._stream_gen:
+            # stream bookkeeping is gone (worker failed/cleared): the
+            # track is over — old code sat in 'stopped' until n was pressed
+            self._stream_ctx = None
+            self._auto_next()
+            return
+        gen, state, part = ctx
+        tot = self._dl_progress[1] if self._dl_progress else 0
+        tr = self.current
+        dur = tr.duration if tr else 0
+        pos_sec = self.player.position_ms() / 1000
+        if tot > 0 and dur > 0:
+            buffered = (state["copied"] / tot) * dur
+            remaining = dur - pos_sec
+            if buffered < remaining - 1.0:
+                # more audio is still coming — wait for the downloader;
+                # _stream_tick hops and resumes as chunks land. If nothing
+                # lands, the give-up timer ends the track instead of
+                # hanging in 'buffering' forever
+                t = threading.Timer(12.0, self._stall_giveup, args=(gen,))
+                t.daemon = True
+                t.start()
+                return
+        # the rest of the song is (nearly) downloaded: it played to the end
+        self._stream_ctx = None
+        self._auto_fails = 0
+        self._auto_next()
 
     # ---------- lyrics ----------
     def _reset_lyrics(self):
