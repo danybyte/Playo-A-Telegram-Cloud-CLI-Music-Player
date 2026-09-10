@@ -108,7 +108,58 @@ class PlayoApp:
         self._retired_playfiles = []      # .play copies awaiting deletion
         self._notes = []                       # thread-safe UI notifications
         self._tui_note = None
+        self.smtc = None
+        if os.name == "nt":
+            try:
+                from .smtc import SMTCBridge
+                self.smtc = SMTCBridge(self._smtc_snapshot, self._smtc_button)
+            except Exception:
+                self.smtc = None
         self.rescan()
+
+    # ---------- system media controls ----------
+    def _smtc_snapshot(self):
+        """State for the Windows 'now playing' overlay."""
+        tr = self.current
+        return {
+            "title": tr.title if tr else "",
+            "artist": (tr.artist or "") if tr else "",
+            "album": getattr(self, "lrc_album", None) or "",
+            "duration": float(tr.duration or 0) if tr else 0.0,
+            "pos": self.player.position_ms() / 1000.0,
+            "state": self.player.state,
+        }
+
+    def _smtc_button(self, action):
+        """Hardware media keys / overlay buttons (headphone play/pause)."""
+        st = self.player.state
+        if action == "stop":
+            self.player.stop()
+        elif action in ("play", "pause", "toggle"):
+            if st == "stopped":
+                self._smtc_start()
+            elif action == "pause":
+                self.player.pause()
+            elif action == "play":
+                self.player.play()
+            else:
+                self.player.toggle()
+        elif action in ("next", "prev"):
+            self._smtc_start(self._step(1 if action == "next" else -1))
+
+    def _smtc_start(self, i=None):
+        """Start/switch playback from the SMTC event thread.
+
+        The WinRT callback must never block on a download (a cloud track
+        would freeze the whole bridge), so heavy work goes to a daemon
+        thread — the same pattern as the auto-advance timer."""
+        if i is None:
+            i = self.index if self.index is not None else 0
+        if i is None or not self.tracks:
+            return
+        tui = getattr(self, "_tui", False)
+        threading.Thread(target=self.play_async if tui else self.play_index,
+                         args=(i,), daemon=True).start()
 
     # ---------- library ----------
     def rescan(self):
@@ -1289,6 +1340,8 @@ class PlayoApp:
 
         if cmd in ("exit", "quit"):
             self.player.close()
+            if self.smtc:
+                self.smtc.close()
             return False
         elif cmd == "help":
             print(HELP)
@@ -1447,3 +1500,5 @@ def main():
             print(f"ui error: {e}")
         finally:
             app.player.close()
+            if app.smtc:
+                app.smtc.close()
