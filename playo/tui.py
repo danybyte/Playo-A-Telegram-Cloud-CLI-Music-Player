@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 
 try:
     import msvcrt
@@ -16,6 +17,20 @@ except ImportError:
 ACCENT, YELLOW, DIM, BOLD, RST = "\x1b[96m", "\x1b[93m", "\x1b[2m", "\x1b[1m", "\x1b[0m"
 GREEN = "\x1b[92m"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# control chars except ESC (ANSI sequences are handled by ANSI_RE) —
+# a stray \r or \n inside a title/note would scroll the whole dashboard
+_CTRL_RE = re.compile(r"[\x00-\x1a\x1c-\x1f\x7f]")
+
+
+def _cwidth(ch):
+    """Terminal cell width: combining marks 0, East-Asian wide 2, else 1.
+
+    fit() used to count every char as 1 column — an emoji/wide char in a
+    title made the row physically wider than the terminal, the terminal
+    wrapped it and the whole screen scrolled up (then back on redraw)."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
 def fmt(sec):
@@ -24,11 +39,15 @@ def fmt(sec):
 
 
 def vis(s):
-    return len(ANSI_RE.sub("", s))
+    s = ANSI_RE.sub("", _CTRL_RE.sub("", s))
+    if s.isascii():
+        return len(s)
+    return sum(_cwidth(c) for c in s)
 
 
 def fit(s, w):
     """Truncate to w visible columns, pad to exactly w."""
+    s = _CTRL_RE.sub("", s)
     i = used = 0
     res = ""
     while i < len(s):
@@ -37,15 +56,17 @@ def fit(s, w):
             res += m.group(0)
             i = m.end()
             continue
-        if used >= w:
+        cw = _cwidth(s[i])
+        if used + cw > w:
             break
         res += s[i]
-        used += 1
+        used += cw
         i += 1
     return res + (RST if vis(s) > w else "") + " " * max(0, w - used)
 
 
 def clip(s, w):
+    s = _CTRL_RE.sub("", s)
     if vis(s) <= w:
         return s
     i = used = 0
@@ -56,8 +77,11 @@ def clip(s, w):
             res += m.group(0)
             i = m.end()
             continue
+        cw = _cwidth(s[i])
+        if used + cw > w - 1:
+            break
         res += s[i]
-        used += 1
+        used += cw
         i += 1
     return res + "…"
 
@@ -784,8 +808,12 @@ class LiveView:
         if self.overlay:
             self._render_overlay(L, cols, rows)
 
-        sys.stdout.write("\x1b[H" + "\n\x1b[K".join(L) + "\x1b[K\x1b[J")
-        sys.stdout.flush()
+        # write to the saved REAL console stream — sys.stdout is the
+        # guard stand-in while the dashboard is up (stray background
+        # prints go to ui.log, never the screen)
+        out = getattr(self, "_out", None) or sys.stdout
+        out.write("\x1b[H" + "\n\x1b[K".join(L) + "\x1b[K\x1b[J")
+        out.flush()
 
     def _row(self, mark, num, title, artist, dur, w, playing=False):
         left = 10                                  # ' > ⇣ 123  '
@@ -1209,11 +1237,88 @@ class LiveView:
             pass
         self.app._tui_note = (time.time(), f"! {where}: {exc}")
 
+    # ---------- console shield ----------
+    # While the alt-screen dashboard is up, ANY stray write to stdout or
+    # stderr from a background thread (a traceback, a library warning, a
+    # missed guard) scrolls the console and wrecks the layout — text
+    # jumps up, then snaps back on the next redraw. sys.stdout/stderr are
+    # swapped for a logging stand-in; the dashboard itself writes to the
+    # saved real console stream, so rendering is never affected.
+    class _GuardWriter:
+        """sys.stdout stand-in: diverts stray writes into ui.log."""
+
+        def __init__(self, log):
+            self.log = log
+            self.encoding = "utf-8"
+            self.errors = "replace"
+
+        def write(self, text):
+            try:
+                if self.log and text:
+                    self.log.write(text.encode("utf-8", "replace"))
+            except Exception:
+                pass
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            return self.log.fileno() if self.log else 1
+
+        def close(self):
+            pass
+
+        def writable(self):
+            return True
+
+        def readable(self):
+            return False
+
+        def seekable(self):
+            return False
+
+    @staticmethod
+    def _thread_excepthook(args):
+        """Daemon threads (auto-advance timers, stream workers) must never
+        print a traceback to the console — log it instead."""
+        import traceback
+        from . import config as cfgmod
+        try:
+            with open(os.path.join(cfgmod.CONFIG_DIR, "error.log"), "a",
+                      encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] thread "
+                        f"{args.thread.name if args.thread else '?'}: "
+                        f"{args.exc_value!r}\n")
+                if args.exc_traceback:
+                    f.write("".join(traceback.format_exception(
+                        args.exc_type, args.exc_value,
+                        args.exc_traceback)) + "\n")
+        except Exception:
+            pass
+
     def run(self):
         if msvcrt is None:
             print("Live view is only supported on Windows right now.")
             return
-        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        from . import config as cfgmod
+        out = sys.stdout            # the REAL console stream, kept aside
+        self._out = out
+        real_out, real_err = sys.stdout, sys.stderr
+        try:
+            log = open(os.path.join(cfgmod.CONFIG_DIR, "ui.log"), "ab",
+                       buffering=0)
+        except OSError:
+            log = None
+        out.write("\x1b[?1049h\x1b[?25l")
+        out.flush()
+        guard = self._GuardWriter(log)
+        sys.stdout = sys.stderr = guard
+        prev_hook = threading.excepthook
+        threading.excepthook = self._thread_excepthook
         try:
             while True:
                 try:
@@ -1236,5 +1341,13 @@ class LiveView:
         except KeyboardInterrupt:
             pass
         finally:
-            sys.stdout.write("\x1b[?25h\x1b[?1049l\x1b[0m")
+            threading.excepthook = prev_hook
+            sys.stdout, sys.stderr = real_out, real_err
+            out.write("\x1b[?25h\x1b[?1049l\x1b[0m")
+            out.flush()
+            try:
+                if log:
+                    log.close()
+            except Exception:
+                pass
             sys.stdout.flush()
