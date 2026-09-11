@@ -15,6 +15,7 @@ DEFAULTS = {
     "last_msg_id": 0,            # for incremental sync
     "auto_sync": True,           # background sync at startup (every 30s)
     "sort": "title",             # library sort: title | artist | duration | recent
+    "show": "all",               # library list: all (whole channel) | local (downloaded only)
     "seek_back": "seconds",      # ← key: "seconds" (±5s) or "lyric" (prev line)
     "lyrics_pick": False,        # ON = pick from the first 5 lyric results
     "volume": 80,

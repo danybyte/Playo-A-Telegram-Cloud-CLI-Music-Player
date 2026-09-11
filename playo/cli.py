@@ -47,7 +47,7 @@ HELP = """
   sort [key]        sort library: title | artist | duration | recent
   ui | tui          full-screen player — control everything with the keyboard
   set <key> <val>   change setting (channel, download_dir, bot_token,
-                     user_session, auto_sync)
+                     user_session, auto_sync, show)
   open              open the download folder in Explorer
   setup             initial setup (guided)
   rescan            rescan the folder
@@ -327,6 +327,13 @@ class PlayoApp:
             if self.index is not None and self.index in self.order:
                 self.order.remove(self.index)
                 self.order.insert(0, self.index)
+
+    def visible_indices(self):
+        """Tracks the user wants to see (config 'show'):
+        all = the whole channel catalog, local = downloaded files only."""
+        if self.cfg.get("show", "all") == "local":
+            return [i for i, t in enumerate(self.tracks) if t.downloaded]
+        return list(range(len(self.tracks)))
 
     def _find(self, q):
         """Space-insensitive search: 'song4' matches 'Song 4', and the
@@ -1289,11 +1296,17 @@ class PlayoApp:
     def cmd_set(self, key, *value):
         val = " ".join(value)
         if key not in ("channel", "download_dir", "bot_token", "api_hash",
-                       "api_id", "user_session", "auto_sync", "lyrics_pick"):
-            print("Valid keys: channel | download_dir | bot_token | api_hash | api_id | user_session | auto_sync | lyrics_pick")
+                       "api_id", "user_session", "auto_sync", "lyrics_pick",
+                       "show"):
+            print("Valid keys: channel | download_dir | bot_token | api_hash | api_id | user_session | auto_sync | lyrics_pick | show")
             return
         if key in ("user_session", "auto_sync", "lyrics_pick"):
             val = val.lower() in ("1", "true", "yes", "on")
+        if key == "show":
+            val = val.lower()
+            if val not in ("all", "local"):
+                print("show: all | local")
+                return
         if key == "api_id":
             val = int(val)
         self.cfg[key] = val
@@ -1353,7 +1366,11 @@ class PlayoApp:
             self.cmd_watch()
         elif cmd in ("list", "ls"):
             q = " ".join(args)
-            idxs = self._find(q) if q else list(range(len(self.tracks)))
+            if q:
+                allow = set(self.visible_indices())
+                idxs = [i for i in self._find(q) if i in allow]
+            else:
+                idxs = self.visible_indices()
             if not idxs:
                 print("No matches found.")
             for i in idxs:

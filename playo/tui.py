@@ -105,6 +105,41 @@ def volume_bar(v, w=10):
     return "█" * f + "░" * (w - f)
 
 
+def _wrap_lyric(text, width):
+    """Word-wrap one lyric line to `width` visible columns (wide-char
+    aware). A word wider than the pane is hard-split, so a narrow window
+    never silently hides part of a line."""
+    width = max(4, width)
+    rows = []
+    cur = ""
+    for word in text.split(" "):
+        while vis(word) > width:
+            if cur:
+                rows.append(cur)
+                cur = ""
+            take = ""
+            used = 0
+            while word:
+                cw = _cwidth(word[0])
+                if used + cw > width:
+                    break
+                take += word[0]
+                used += cw
+                word = word[1:]
+            rows.append(take)
+        if not word:
+            continue
+        cand = f"{cur} {word}" if cur else word
+        if vis(cand) <= width:
+            cur = cand
+        else:
+            if cur:
+                rows.append(cur)
+            cur = word
+    rows.append(cur)
+    return rows
+
+
 class LiveView:
     """Full-screen dashboard player.
 
@@ -147,8 +182,9 @@ class LiveView:
 
     def _hits(self):
         if self.flt:
-            return self.app._find(self.flt)
-        return list(range(len(self.app.tracks)))
+            allow = set(self.app.visible_indices())
+            return [i for i in self.app._find(self.flt) if i in allow]
+        return self.app.visible_indices()
 
     def _set_filter(self, text):
         """Change the filter, but keep the cursor on the SAME track.
@@ -267,6 +303,8 @@ class LiveView:
                         "some songs: + on them, then Enter",
         "sync_now":   "full re-index — fills gaps the incremental "
                       "auto-sync missed",
+        "show":       "all = every song in the channel (cloud ⇣ included) · "
+                      "local = only downloaded files",
     }
 
     def _settings_rows(self):
@@ -297,6 +335,8 @@ class LiveView:
                          "Enter, then press an F-key"))
         rows += [
             ("_sec", "TELEGRAM / LIBRARY", ""),
+            ("show",       app.cfg.get("show", "all"),
+                           "enter · all | local"),
             ("auto_sync",  ("ON " if app.cfg.get("auto_sync", True) else "OFF"),
                            "enter"),
             ("sync_now",   ("syncing…" if getattr(self, "_sync_busy", False)
@@ -368,6 +408,12 @@ class LiveView:
                                         app.cfg.get("seek_back") == "lyric"
                                         else "lyric")
                 save()
+            elif name == "show":
+                app.cfg["show"] = ("local" if
+                                    app.cfg.get("show", "all") == "all"
+                                    else "all")
+                save()
+                self._note(f"show: {app.cfg['show']}")
             elif name == "channel":
                 self._edit = str(app.cfg.get("channel", ""))
                 self._edit_mode = True
@@ -381,6 +427,12 @@ class LiveView:
                                         app.cfg.get("seek_back") == "lyric"
                                         else "lyric")
                 save()
+            elif name == "show":
+                app.cfg["show"] = ("local" if
+                                    app.cfg.get("show", "all") == "all"
+                                    else "all")
+                save()
+                self._note(f"show: {app.cfg['show']}")
             elif name == "channel":
                 self._edit = str(app.cfg.get("channel", ""))
                 self._edit_mode = True
@@ -391,6 +443,12 @@ class LiveView:
                 self._sync_now()
             elif name == "add_account":
                 self._login_flow()
+            elif name == "show":
+                app.cfg["show"] = ("local" if
+                                    app.cfg.get("show", "all") == "all"
+                                    else "all")
+                save()
+                self._note(f"show: {app.cfg['show']}")
             elif name == "auto_sync":
                 app.cfg["auto_sync"] = not app.cfg.get("auto_sync", True)
                 save()
@@ -908,6 +966,8 @@ class LiveView:
     def _lib_hdr_text(self, app):
         sort = app.cfg.get("sort", "title")
         hdr = f"LIBRARY  {len(self.hits)}/{len(app.tracks)}  ·  sort: {sort}"
+        if app.cfg.get("show", "all") == "local":
+            hdr += f"  ·  {YELLOW}local only{RST}"
         if app.shuffle:
             hdr += f"  ·  {GREEN}SHUFFLE{RST}"
         vol = int(app.player.volume * 100)
@@ -925,6 +985,11 @@ class LiveView:
             if not app.tracks:
                 out.append(fit(f"   {DIM}catalog is empty — new channel posts"
                                f" appear here live{RST}", w))
+            elif self.flt:
+                out.append(fit(f"   {DIM}no matches for '{self.flt}'{RST}", w))
+            elif app.cfg.get("show", "all") == "local":
+                out.append(fit(f"   {DIM}nothing downloaded yet — set show: all"
+                               f" (settings) to browse the channel{RST}", w))
             else:
                 out.append(fit(f"   {DIM}no matches for '{self.flt}'{RST}", w))
         else:
@@ -1005,46 +1070,75 @@ class LiveView:
             out.append(ch)
         return "".join(out)
 
+    def _lyric_rows(self, width, src, synced):
+        """Wrapped display rows for the active lyrics, cached per source
+        object + width (re-wrapping every frame would burn CPU)."""
+        if src is None:
+            return None
+        if getattr(self, "_lrc_wrap_src", None) is not src or \
+                getattr(self, "_lrc_wrap_w", None) != width:
+            lines = [line for _, line in src] if synced else src.splitlines()
+            self._lrc_wrap_src = src
+            self._lrc_wrap_w = width
+            self._lrc_wrap = [_wrap_lyric(t or "", width) for t in lines]
+        return self._lrc_wrap
+
     def _render_lyrics(self, L, n, w):
         app = self.app
         tr = app.current
-        if app.lrc:
-            lines = app.lrc
+        lines = app.lrc
+        plain = app.lrc_plain
+        wrapped = None
+        if lines:
+            wrapped = self._lyric_rows(w - 3, lines, True)
+        elif plain:
+            wrapped = self._lyric_rows(w - 3, plain, False)
+        if lines:
             times = [t for t, _ in lines]
             idx = max(0, bisect.bisect_right(times, app.player.position_ms()) - 1)
-            lo = max(0, min(idx - n // 2, len(lines) - n))
-            hi = min(len(lines), lo + n)
             phase = int(time.time() * 2.5) % 3      # 400ms per step
-            for k in range(lo, hi):
-                ms, line = lines[k]
-                if line and line.strip():
-                    txt = line
-                elif k == idx:
-                    # animated ♪♪♪ loader — only while playback is ON this
-                    # line; passed/upcoming interludes stay gray
-                    if phase == 0:
-                        txt = f"{ACCENT}♪{RST}{DIM}♪♪{RST}"
-                    elif phase == 1:
-                        txt = f"{DIM}♪{RST}{ACCENT}♪{RST}{DIM}♪{RST}"
-                    else:
-                        txt = f"{DIM}♪♪{RST}{ACCENT}♪{RST}"
+            flat = []                     # (line_index, wrapped piece)
+            starts = []
+            for k, pieces in enumerate(wrapped):
+                starts.append(len(flat))
+                flat.extend((k, p) for p in pieces)
+            # window keeps the WHOLE current line visible (every wrapped
+            # row of it) when it fits; from its first row when it doesn't
+            cur_len = len(wrapped[idx])
+            if cur_len >= n:
+                rlo = starts[idx]
+            else:
+                rlo = max(0, min(starts[idx] - (n - cur_len) // 2,
+                                 max(0, len(flat) - n)))
+            for r in range(rlo, min(len(flat), rlo + n)):
+                k, piece = flat[r]
+                if not (piece and piece.strip()) and k != idx:
+                    L.append(fit(f"   {DIM}♪♪♪{RST}", w))
+                    continue
+                if piece and piece.strip():
+                    txt = piece
+                elif phase == 0:
+                    txt = f"{ACCENT}♪{RST}{DIM}♪♪{RST}"
+                elif phase == 1:
+                    txt = f"{DIM}♪{RST}{ACCENT}♪{RST}{DIM}♪{RST}"
                 else:
-                    txt = f"{DIM}♪♪♪{RST}"
+                    txt = f"{DIM}♪♪{RST}{ACCENT}♪{RST}"
                 if k == idx:
                     # same 3-space indent as every other row — never sticks
-                    # to the column separator
+                    # to the column separator; wrapped continuations share
+                    # the bold highlight while the line is current
                     L.append(fit(f"   {BOLD}{txt}{RST}", w))
                 else:
                     L.append(fit(f"   {DIM}{txt}{RST}", w))
-        elif app.lrc_plain:
-            shown = app.lrc_plain.splitlines()
+        elif plain:
+            flat = [p for pieces in wrapped for p in pieces]
             if tr and tr.duration > 0:
                 frac = min(1.0, max(0.0, app.player.position_ms() / 1000 / tr.duration))
-                start = int(frac * max(0, len(shown) - n + 1))
+                start = int(frac * max(0, len(flat) - (n - 1)))
             else:
                 start = 0
-            for line in shown[start:start + n - 1]:
-                L.append(fit(f"   {DIM}{line}{RST}", w))
+            for txt in flat[start:start + n - 1]:
+                L.append(fit(f"   {DIM}{txt}{RST}", w))
             L.append(fit(f"   {DIM}(plain — no sync){RST}", w))
         elif getattr(app, "_lyrics_fetching", None):
             L.append(fit(f" {ACCENT}◌{RST} {DIM}searching lyrics…{RST}", w))
