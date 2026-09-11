@@ -140,6 +140,20 @@ def _wrap_lyric(text, width):
     return rows
 
 
+def _hint_line(lead, items, w):
+    """Help line that degrades gracefully on narrow windows: whole
+    'key label' hints drop out instead of being cut mid-word."""
+    out = lead
+    used = vis(lead)
+    for key, label in items:
+        need = 2 + vis(key) + 1 + vis(label)
+        if used + need > w:
+            continue
+        out += f"  {DIM}{key}{RST} {label}"
+        used += need
+    return fit(out, w)
+
+
 class LiveView:
     """Full-screen dashboard player.
 
@@ -999,15 +1013,16 @@ class LiveView:
             L.append(fit(f"    filter:{RST} {BOLD}{self.flt or '…'}█{RST}"
                          f"  {DIM}off in {left}s — keep typing{RST}", w))
         else:
-            L.append(fit(f" {BOLD}PLAYO{RST}  {DIM}Tab{RST} search  "
-                         f"{DIM}Space{RST} play/pause  {DIM}Enter{RST} play sel"
-                         f"  {DIM}{K['next']}{RST} next  {DIM}{K['prev']}{RST}"
-                         f" prev  {DIM}←→{RST} seek", w))
-            L.append(fit(f"    {DIM}+−|↑↓{RST} vol  {DIM}{K['mute']}{RST} mute"
-                         f"  {DIM}F3{RST} settings  {DIM}{K['shuffle']}{RST}"
-                         f" shuffle  {DIM}z{RST} shuf-play  {DIM}{K['sort']}{RST}"
-                         f" sort  {DIM}F4{RST} lyrics"
-                         f"  {DIM}Esc²{RST} quit", w))
+            L.append(_hint_line(
+                f" {BOLD}PLAYO{RST}",
+                [("Tab", "search"), ("Space", "play/pause"),
+                 ("Enter", "play"), (f"{K['next']}/{K['prev']}", "next·prev"),
+                 ("←→", "seek"), ("Esc²", "quit")], w))
+            L.append(_hint_line(
+                "    ",
+                [("+−/↑↓", "vol"), (K["mute"], "mute"), ("F3", "settings"),
+                 (K["shuffle"], "shuffle"), ("z", "shuf-play"),
+                 (K["sort"], "sort"), ("F4", "lyrics")], w))
         if self.flt and not self.searching:
             # filter stays applied after search closes — make that obvious
             L.append(fit(f" {ACCENT}filter:{RST} {BOLD}{self.flt}{RST}"
@@ -1260,8 +1275,8 @@ class LiveView:
         # show: local counts only downloaded files (next/prev walk them)
         walk = app.order
         if app.cfg.get("show", "all") == "local":
-            vis = set(app.visible_indices())
-            walk = [i for i in app.order if i in vis] or app.order
+            vis_set = set(app.visible_indices())
+            walk = [i for i in app.order if i in vis_set] or app.order
         if app.index is not None and app.index in walk:
             qpos = walk.index(app.index) + 1
         else:
@@ -1269,35 +1284,70 @@ class LiveView:
         label = "queue" if app.shuffle else "track"
         q = f"{DIM}[{label} {qpos}/{len(walk)}]{RST}"
         album = getattr(app, "lrc_album", None)
-        album_bit = (f"  {GREEN}· Album: {album}{RST}" if album
-                     and album.lower() not in tr.title.lower()
-                     else "")
-        line = f" {ACCENT}{status}{RST} {BOLD}{tr.title}{RST} " \
-               f"{DIM}— {tr.artist or '?'}{RST}{album_bit} {q}"
+        title = tr.title or "?"
+        artist = tr.artist or "?"
+        # narrow-safe now-playing line: the album gives way first, then
+        # the artist shrinks, then the title — the queue tag always stays
+        q_v = vis(q)
+        room = max(0, w - 4 - q_v)
+        alb_txt = ""
+        if album and album.lower() not in title.lower():
+            max_alb = room - vis(title) - 3 - min(vis(artist), 24) - 9
+            if max_alb >= 3:
+                alb_txt = clip(album, max_alb)
+        if alb_txt:
+            room -= vis(alb_txt) + 11       # '  · Album: '
+        sep = 3 if artist else 0
+        a_room = min(vis(artist), max(0, (room - sep) // 3))
+        t_room = room - sep - a_room
+        if t_room < 4:
+            a_room = max(0, room - 7)
+            t_room = max(4, room - sep - a_room)
+        artist_s = clip(artist, a_room)
+        line = f" {ACCENT}{status}{RST} {BOLD}{clip(title, t_room)}{RST}"
+        if artist_s:
+            line += f" {DIM}— {artist_s}{RST}"
+        if alb_txt:
+            line += f"  {GREEN}· Album: {alb_txt}{RST}"
+        line += f" {q}"
         out.append(fit(line, w))
         pos = app.player.position_ms() / 1000
-        pb = progress_bar(pos, tr.duration, max(10, min(30, w - 40)))
         vol = int(app.player.volume * 100)
-        # single stepped volume meter (green), grows/shrinks with volume
-        meter = f"{GREEN}{self._vol_meter(vol, 16)}{RST}"
-        bits = [f"{pb} {DIM}{fmt(pos)}/{fmt(tr.duration)}{RST}",
-                f"{DIM}VOL{RST} {meter} {vol:3d}%"]
+        status_bits = []
         if vol == 0:
-            bits.append(f"{YELLOW}MUTE{RST}")
+            status_bits.append(f"{YELLOW}MUTE{RST}")
         if app.shuffle:
-            bits.append(f"{GREEN}SHUF{RST}")
+            status_bits.append(f"{GREEN}SHUF{RST}")
         dlbit = self._dl_bit()
         if dlbit:
-            bits.append(dlbit)
+            status_bits.append(dlbit)
         # a download error shows once, then clears (no permanent '!')
         err = getattr(app, "_dl_error", None)
         if err and err != getattr(self, "_last_err_shown", None):
             self._last_err_shown = err
-            bits.append(f"{YELLOW}! {clip(err, 30)}{RST}")
+            status_bits.append(f"{YELLOW}! {clip(err, 30)}{RST}")
         else:
             app._dl_error = None
             self._last_err_shown = None
-        out.append(fit(" " + "  ".join(bits), w))
+        # narrow-safe: the volume meter shrinks first, then the progress
+        # bar — time, VOL % and the status bits always stay visible
+        meter_w = 16
+        pb_w = max(10, min(30, w - 40))
+        while True:
+            pb = progress_bar(pos, tr.duration, pb_w)
+            vol_bit = (f"{DIM}VOL{RST} {GREEN}{self._vol_meter(vol, meter_w)}"
+                       f"{RST} {vol:3d}%" if meter_w
+                       else f"{DIM}VOL{RST} {vol:3d}%")
+            line = " " + "  ".join(
+                [f"{pb} {DIM}{fmt(pos)}/{fmt(tr.duration)}{RST}", vol_bit]
+                + status_bits)
+            if vis(line) <= w or (meter_w == 0 and pb_w <= 10):
+                break
+            if meter_w:
+                meter_w = 8 if meter_w > 8 else 0
+            else:
+                pb_w = max(10, pb_w - 6)
+        out.append(fit(line, w))
         return out
 
     def _dl_bit(self):
