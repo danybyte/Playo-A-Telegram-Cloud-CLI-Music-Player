@@ -154,7 +154,7 @@ class LiveView:
         self.searching = False        # ON only after Tab; OFF = player keys
         self.sel = 0                  # selection within hits
         self.show_lyrics = True
-        self.overlay = None           # None | "settings" | "picker"
+        self.overlay = None           # None | "settings" | "picker" | "reset_pick"
         self._last_vol = 60
         self.hits = list(range(len(app.tracks)))
 
@@ -308,7 +308,10 @@ class LiveView:
                        "results — ↑↓ + Enter picks, lyrics are saved",
         "lyrics_reset": "deletes every lyric file in ~/.playo/lyrics — "
                         "next plays refetch from the source. To reset only "
-                        "some songs: + on them, then Enter",
+                        "some songs: use reset_selected",
+        "lyrics_sel":  "opens every song — type to filter the list, + "
+                       "selects/deselects the one under the cursor, Enter "
+                       "deletes the saved lyrics of all selected, Esc cancels",
         "sync_now":   "full re-index — fills gaps the incremental "
                       "auto-sync missed",
         "show":       "all = every song in the channel (cloud ⇣ included) · "
@@ -333,6 +336,8 @@ class LiveView:
                        "enter · pick from 5 lyric results"),
             ("lyrics_reset", "reset all",
                        "enter · deletes ALL saved lyrics"),
+            ("lyrics_sel", "reset selected",
+                       "enter — pick songs with +, Enter resets"),
             ("_sec", "KEYS", ""),
         ]
         # rebindable keys (letters are reserved for search — use F-keys/symbols)
@@ -472,6 +477,12 @@ class LiveView:
                 n = lyrics_mod.clear_all_cache()
                 app._reset_lyrics()       # current track refetches
                 self._note(f"ALL saved lyrics wiped ({n} files)")
+            elif name == "lyrics_sel":
+                self._overlay_sel = self.sel     # settings row to restore
+                self.overlay = "reset_pick"
+                self.sel = 0
+                self._reset_sel = set()
+                self._reset_flt = ""
             elif name == "user_session":
                 app.cfg["user_session"] = not app.cfg.get("user_session")
                 save()
@@ -541,6 +552,9 @@ class LiveView:
             return
         if self.overlay == "picker":
             self._handle_picker(key)
+            return
+        if self.overlay == "reset_pick":
+            self._handle_reset_pick(key)
             return
         if self.overlay == "settings":
             self._handle_settings(key)
@@ -840,6 +854,71 @@ class LiveView:
             self._picker_apply(self.sel)
         elif isinstance(key, str) and len(key) == 1 and key in "12345":
             self._picker_apply(int(key) - 1)
+
+    # ---------- reset selected lyrics (settings) ----------
+    def _reset_view(self):
+        """Songs shown in the reset-selected overlay (full-list indices):
+        the typed filter narrows them via the same search as the library."""
+        app = self.app
+        q = getattr(self, "_reset_flt", "")
+        if q:
+            return app._find(q)
+        return list(range(len(app.tracks)))
+
+    def _handle_reset_pick(self, key):
+        """Song list for 'reset selected': typing filters the list, +
+        toggles the song under the cursor, Enter wipes the saved lyrics
+        of every selected song (selections survive refiltering)."""
+        app = self.app
+        view = self._reset_view()
+        n = len(view)
+        if key == "esc":
+            self._close_overlay()
+        elif key in ("+", "="):
+            if not n:
+                return
+            sel = getattr(self, "_reset_sel", None)
+            if sel is None:
+                sel = self._reset_sel = set()
+            i = view[self.sel]
+            if i in sel:
+                sel.discard(i)
+            else:
+                sel.add(i)
+        elif key == "up":
+            self.sel = max(0, self.sel - 1)
+        elif key == "down":
+            self.sel = min(max(0, n - 1), self.sel + 1)
+        elif key == "pgup":
+            self.sel = max(0, self.sel - 10)
+        elif key == "pgdn":
+            self.sel = min(max(0, n - 1), self.sel + 10)
+        elif key == "home":
+            self.sel = 0
+        elif key == "end":
+            self.sel = max(0, n - 1)
+        elif key == "\x08":
+            self._reset_flt = getattr(self, "_reset_flt", "")[:-1]
+            self.sel = 0
+        elif key in ("\r", "\n"):
+            sel = getattr(self, "_reset_sel", set()) or set()
+            if not sel:
+                self._note("nothing selected — + picks a song")
+                return
+            from . import lyrics as lyrics_mod
+            done = 0
+            for i in sorted(sel):
+                if 0 <= i < len(app.tracks):
+                    t = app.tracks[i]
+                    if lyrics_mod.clear_cache(t.artist, t.title):
+                        done += 1
+            app._reset_lyrics()          # current track refetches
+            self._close_overlay()
+            self._note(f"lyrics reset for {done} song"
+                       f"{'s' if done != 1 else ''}")
+        elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+            self._reset_flt = getattr(self, "_reset_flt", "") + key
+            self.sel = 0
 
     # ---------- render ----------
     def _render(self):
@@ -1272,6 +1351,43 @@ class LiveView:
                              f"  {DIM}· {n_lines} lines{RST}")
             if not cands:
                 lines.append(f" {DIM}no results{RST}")
+        elif self.overlay == "reset_pick":
+            app = self.app
+            sel_set = getattr(self, "_reset_sel", set()) or set()
+            flt = getattr(self, "_reset_flt", "")
+            view = self._reset_view()
+            n = len(view)
+            lines = [f"{BOLD}RESET LYRICS — SELECT SONGS{RST}  "
+                     f"{DIM}(type = search · ↑↓ move · + select ·"
+                     f" Enter reset · Esc cancel){RST}"]
+            lines.append(f" {GREEN}{BOLD}{len(sel_set)} selected{RST}"
+                         + (f"  {DIM}filter:{RST} {BOLD}{clip(flt, 24)}█{RST}"
+                            f"  {DIM}({n} match{'es' if n != 1 else ''}){RST}"
+                            if flt else
+                            f"  {DIM}· {n} songs · type to search{RST}"))
+            if not n:
+                lines.append(f" {DIM}"
+                             + ("no matches for the filter" if flt
+                                else "no songs in the library") + f"{RST}")
+            else:
+                view_n = max(3, body_rows - 5)
+                lo = max(0, min(self.sel - view_n // 2, n - view_n))
+                hi = min(n, lo + view_n)
+                lines.append(f" {DIM}showing {lo + 1}–{hi} of {n}"
+                             f"{'  (… more above)' if lo > 0 else ''}"
+                             f"{'  (… more below)' if hi < n else ''}{RST}")
+                for pos in range(lo, hi):
+                    i = view[pos]
+                    t = app.tracks[i]
+                    cur = pos == self.sel
+                    mark = (f"{GREEN}{BOLD}+{RST}" if i in sel_set
+                            else f"{DIM}·{RST}")
+                    o = f"{ACCENT}{BOLD}>{RST}" if cur else " "
+                    style = BOLD if cur else ""
+                    title_s = clip(t.title or "?", max(8, w - 44))
+                    artist_s = clip(t.artist or "?", 20)
+                    lines.append(f" {o} {mark} {style}{title_s}{RST}"
+                                 f"  {DIM}— {artist_s}{RST}")
         elif self.overlay == "settings":
             lines = [f"{BOLD}SETTINGS{RST}  {DIM}(↑↓ select · ←/→ adjust ·"
                      f" Enter toggle · Esc close){RST}"]
