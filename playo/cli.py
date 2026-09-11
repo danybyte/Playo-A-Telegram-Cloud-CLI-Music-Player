@@ -145,7 +145,9 @@ class PlayoApp:
             else:
                 self.player.toggle()
         elif action in ("next", "prev"):
-            self._smtc_start(self._step(1 if action == "next" else -1))
+            i = self._step(1 if action == "next" else -1)
+            if i is not None:
+                self._smtc_start(i)
 
     def _smtc_start(self, i=None):
         """Start/switch playback from the SMTC event thread.
@@ -392,7 +394,8 @@ class PlayoApp:
         """Next/prev. Inside a search-results context (ctx_queue set by
         the TUI while a filter is open) the walk follows THAT list — so
         the next song is the next result on screen. Without a context the
-        old system applies: shuffle → random order, else sorted order."""
+        old system applies: shuffle → random order, else sorted order —
+        restricted to the tracks the user chose to see (show: all|local)."""
         if not self.tracks:
             return None
         ctx = [i for i in (getattr(self, "ctx_queue", None) or [])
@@ -402,10 +405,16 @@ class PlayoApp:
                 pos = ctx.index(self.index)
                 return ctx[(pos + direction) % len(ctx)]
             return ctx[0] if direction > 0 else ctx[-1]
-        if self.index is None or self.index not in self.order:
-            return self.order[0]
-        pos = self.order.index(self.index)
-        return self.order[(pos + direction) % len(self.order)]
+        order = self.order
+        if self.cfg.get("show", "all") == "local":
+            dl = {i for i, t in enumerate(self.tracks) if t.downloaded}
+            order = [i for i in order if i in dl]
+            if not order:
+                return None
+        if self.index is None or self.index not in order:
+            return order[0]
+        pos = order.index(self.index)
+        return order[(pos + direction) % len(order)]
 
     def set_volume(self, v):
         self.player.set_volume(v)
@@ -1407,9 +1416,13 @@ class PlayoApp:
             self.player.stop()
             print("■ Stopped.")
         elif cmd == "next":
-            self.play_index(self._step(1) or 0)
+            nxt = self._step(1)
+            if nxt is not None:
+                self.play_index(nxt)
         elif cmd == "prev":
-            self.play_index(self._step(-1) or 0)
+            prv = self._step(-1)
+            if prv is not None:
+                self.play_index(prv)
         elif cmd == "seek":
             if not args:
                 print("Example: seek 90 | seek +15 | seek -30")

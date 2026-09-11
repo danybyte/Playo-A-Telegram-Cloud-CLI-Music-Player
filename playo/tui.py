@@ -265,13 +265,21 @@ class LiveView:
         self._note(f"shuffle {'ON' if app.shuffle else 'OFF'}")
 
     def _shuffle_play(self):
-        """Shuffle play: shuffle ON (if off) + a random track starts now."""
+        """Shuffle play: shuffle ON (if off) + a random track starts now.
+        The pool follows the show setting — local mode picks only among
+        downloaded files."""
         app = self.app
         if not app.tracks:
             return
+        vis = set(app.visible_indices())
+        if not vis:
+            self._note("nothing to play — show: local has no downloaded files")
+            return
         if not app.shuffle:
             app.toggle_shuffle()
-        pool = [i for i in app.order if i != app.index] or app.order
+        pool = [i for i in app.order if i != app.index and i in vis]
+        if not pool:
+            pool = [i for i in app.order if i in vis]
         self._play(random.choice(pool))
         self._note("shuffle play — random track started")
 
@@ -1169,13 +1177,18 @@ class LiveView:
                            f" · {app.cfg['download_dir']}{RST}", w))
             return out
         # position within the PLAYBACK order — labeled so shuffle numbers
-        # don't read as the library row number ('queue 2/848' vs '2/848')
-        if app.index is not None and app.index in app.order:
-            qpos = app.order.index(app.index) + 1
+        # don't read as the library row number ('queue 2/848' vs '2/848');
+        # show: local counts only downloaded files (next/prev walk them)
+        walk = app.order
+        if app.cfg.get("show", "all") == "local":
+            vis = set(app.visible_indices())
+            walk = [i for i in app.order if i in vis] or app.order
+        if app.index is not None and app.index in walk:
+            qpos = walk.index(app.index) + 1
         else:
             qpos = app.index + 1 if app.index is not None else 0
         label = "queue" if app.shuffle else "track"
-        q = f"{DIM}[{label} {qpos}/{len(app.tracks)}]{RST}"
+        q = f"{DIM}[{label} {qpos}/{len(walk)}]{RST}"
         album = getattr(app, "lrc_album", None)
         album_bit = (f"  {GREEN}· Album: {album}{RST}" if album
                      and album.lower() not in tr.title.lower()
